@@ -1,0 +1,20 @@
+{
+  "name": "pipedrive-mcp-cf",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Workers + Containers wrapper for Pipedrive MCP server",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250801.0",
+    "typescript": "^5.5.0",
+    "wrangler": "^4.0.0"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "^0.0.20"
+  }
+}
+
