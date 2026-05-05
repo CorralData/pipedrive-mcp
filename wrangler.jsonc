@@ -23,6 +23,12 @@
       }
     ]
   },
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "dae870074ebe45499b771cc37b36d258"
+    }
+  ],
   "migrations": [
     {
       "new_sqlite_classes": ["PipedriveMCPContainer"],
@@ -30,4 +36,3 @@
     }
   ]
 }
-
