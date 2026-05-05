@@ -1,8 +1,8 @@
 {
   "name": "pipedrive-mcp-cf",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Cloudflare Workers + Containers wrapper for Pipedrive MCP server",
+  "description": "Pipedrive MCP server on Cloudflare Workers + Containers, with built-in OAuth provider bridged to CF Access OIDC",
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
@@ -14,7 +14,7 @@
     "wrangler": "^4.0.0"
   },
   "dependencies": {
-    "@cloudflare/containers": "^0.0.20"
+    "@cloudflare/containers": "^0.0.20",
+    "@cloudflare/workers-oauth-provider": "^0.0.5"
   }
 }
-
