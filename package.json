@@ -15,6 +15,6 @@
   },
   "dependencies": {
     "@cloudflare/containers": "^0.0.20",
-    "@cloudflare/workers-oauth-provider": "^0.0.5"
+    "@cloudflare/workers-oauth-provider": "^0.5.0"
   }
 }
