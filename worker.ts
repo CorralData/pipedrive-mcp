@@ -77,7 +77,7 @@ const defaultHandler: ExportedHandler<Env> = {
     if (url.pathname === "/oauth/authorize") {
       // Forward all of claude.ai's OAuth params to the OAuth provider so it
       // can store the request. Then we redirect the user to CF Access.
-      const oauthReqInfo = await (env as any).OAUTH_PROVIDER.parseAuthRequest(request);
+      let oauthReqInfo: any; try { oauthReqInfo = await (env as any).OAUTH_PROVIDER.parseAuthRequest(request); } catch (e: any) { return new Response("DEBUG parseAuthRequest threw: " + (e?.name||"") + ": " + (e?.message||"") + "\nstack: " + (e?.stack||"") + "\nOIDC_ISSUER=" + env.OIDC_ISSUER + "\nOIDC_CLIENT_ID_set=" + !!env.OIDC_CLIENT_ID, { status: 500, headers: { "Content-Type": "text/plain" } }); }
       // Build CF Access OIDC authorize URL
       const upstreamState = crypto.randomUUID();
       // Persist mapping: upstreamState → original OAuth request (for callback)
