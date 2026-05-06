@@ -64,6 +64,23 @@ export default {
       );
     }
 
+    // ---------- Debug: env var presence (no values exposed) ----------
+    if (path === "/__debug") {
+      return json({
+        OIDC_CLIENT_ID_set: !!env.OIDC_CLIENT_ID,
+        OIDC_CLIENT_SECRET_set: !!env.OIDC_CLIENT_SECRET,
+        OIDC_ISSUER_set: !!env.OIDC_ISSUER,
+        OIDC_ISSUER_value: env.OIDC_ISSUER || null, // not secret
+        OIDC_CLIENT_ID_len: env.OIDC_CLIENT_ID?.length || 0,
+        OIDC_CLIENT_SECRET_len: env.OIDC_CLIENT_SECRET?.length || 0,
+        PIPEDRIVE_API_TOKEN_set: !!env.PIPEDRIVE_API_TOKEN,
+        PIPEDRIVE_COMPANY_DOMAIN_set: !!env.PIPEDRIVE_COMPANY_DOMAIN,
+        PIPEDRIVE_COMPANY_DOMAIN_value: env.PIPEDRIVE_COMPANY_DOMAIN || null,
+        OAUTH_KV_set: !!env.OAUTH_KV,
+        PIPEDRIVE_MCP_set: !!env.PIPEDRIVE_MCP,
+      });
+    }
+
     // ---------- OAuth metadata discovery ----------
     if (path === "/.well-known/oauth-authorization-server") {
       return json({
@@ -113,42 +130,53 @@ export default {
 
     // ---------- Authorize: redirect to CF Access OIDC ----------
     if (path === "/oauth/authorize") {
-      const p = url.searchParams;
-      const clientId = p.get("client_id") || "";
-      const redirectUri = p.get("redirect_uri") || "";
-      const state = p.get("state") || "";
-      const codeChallenge = p.get("code_challenge") || "";
-      const codeChallengeMethod = p.get("code_challenge_method") || "";
-      const responseType = p.get("response_type") || "";
-      const scope = p.get("scope") || "openid email profile";
+      try {
+        const p = url.searchParams;
+        const clientId = p.get("client_id") || "";
+        const redirectUri = p.get("redirect_uri") || "";
+        const state = p.get("state") || "";
+        const codeChallenge = p.get("code_challenge") || "";
+        const codeChallengeMethod = p.get("code_challenge_method") || "";
+        const responseType = p.get("response_type") || "";
+        const scope = p.get("scope") || "openid email profile";
 
-      if (responseType !== "code") return new Response("Only response_type=code supported", { status: 400 });
-      if (!clientId || !redirectUri) return new Response("Missing client_id or redirect_uri", { status: 400 });
+        if (responseType !== "code") return new Response("Only response_type=code supported", { status: 400 });
+        if (!clientId || !redirectUri) return new Response("Missing client_id or redirect_uri", { status: 400 });
 
-      // Verify client exists
-      const clientStr = await env.OAUTH_KV.get(`client:${clientId}`);
-      if (!clientStr) return new Response("Unknown client", { status: 400 });
-      const client = JSON.parse(clientStr);
+        // Verify client exists
+        const clientStr = await env.OAUTH_KV.get(`client:${clientId}`);
+        if (!clientStr) return new Response("Unknown client", { status: 400 });
+        const client = JSON.parse(clientStr);
 
-      // Permissive redirect_uri check: must be in registered list (string match)
-      if (!client.redirectUris.includes(redirectUri)) {
-        return new Response(`redirect_uri not registered. Registered: ${JSON.stringify(client.redirectUris)}, requested: ${redirectUri}`, { status: 400 });
+        // Permissive redirect_uri check: must be in registered list (string match)
+        if (!client.redirectUris.includes(redirectUri)) {
+          return new Response(`redirect_uri not registered. Registered: ${JSON.stringify(client.redirectUris)}, requested: ${redirectUri}`, { status: 400 });
+        }
+
+        // Sanity-check OIDC env vars
+        if (!env.OIDC_ISSUER || !env.OIDC_CLIENT_ID) {
+          return new Response(`Server misconfigured: OIDC_ISSUER_set=${!!env.OIDC_ISSUER} OIDC_CLIENT_ID_set=${!!env.OIDC_CLIENT_ID}`, { status: 500 });
+        }
+
+        // Persist the original request keyed by an upstream state UUID
+        const upstreamState = crypto.randomUUID();
+        await env.OAUTH_KV.put(`upstream:${upstreamState}`, JSON.stringify({
+          clientId, redirectUri, state, codeChallenge, codeChallengeMethod, scope,
+        }), { expirationTtl: 600 });
+
+        // Redirect to CF Access OIDC authorize
+        // OIDC_ISSUER may have a trailing slash; strip it
+        const issuer = env.OIDC_ISSUER.replace(/\/$/, "");
+        const cfAuth = new URL(`${issuer}/cdn-cgi/access/sso/oidc/${env.OIDC_CLIENT_ID}/authorization`);
+        cfAuth.searchParams.set("response_type", "code");
+        cfAuth.searchParams.set("client_id", env.OIDC_CLIENT_ID);
+        cfAuth.searchParams.set("redirect_uri", `${url.origin}/oauth/callback`);
+        cfAuth.searchParams.set("scope", "openid email profile");
+        cfAuth.searchParams.set("state", upstreamState);
+        return Response.redirect(cfAuth.toString(), 302);
+      } catch (e: any) {
+        return new Response(`/oauth/authorize error: ${e?.message || e}\nStack: ${e?.stack || "n/a"}`, { status: 500 });
       }
-
-      // Persist the original request keyed by an upstream state UUID
-      const upstreamState = crypto.randomUUID();
-      await env.OAUTH_KV.put(`upstream:${upstreamState}`, JSON.stringify({
-        clientId, redirectUri, state, codeChallenge, codeChallengeMethod, scope,
-      }), { expirationTtl: 600 });
-
-      // Redirect to CF Access OIDC authorize
-      const cfAuth = new URL(`${env.OIDC_ISSUER}/cdn-cgi/access/sso/oidc/${env.OIDC_CLIENT_ID}/authorization`);
-      cfAuth.searchParams.set("response_type", "code");
-      cfAuth.searchParams.set("client_id", env.OIDC_CLIENT_ID);
-      cfAuth.searchParams.set("redirect_uri", `${url.origin}/oauth/callback`);
-      cfAuth.searchParams.set("scope", "openid email profile");
-      cfAuth.searchParams.set("state", upstreamState);
-      return Response.redirect(cfAuth.toString(), 302);
     }
 
     // ---------- Callback from CF Access ----------
