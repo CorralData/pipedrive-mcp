@@ -8,7 +8,8 @@
     "enabled": true
   },
   "vars": {
-    "OIDC_ISSUER": "https://corraldata-co.cloudflareaccess.com"
+    "OIDC_ISSUER": "https://corraldata-co.cloudflareaccess.com",
+    "PIPEDRIVE_COMPANY_DOMAIN": "corraldata"
   },
   "containers": [
     {
