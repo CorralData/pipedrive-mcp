@@ -7,6 +7,9 @@
   "observability": {
     "enabled": true
   },
+  "vars": {
+    "OIDC_ISSUER": "https://corraldata-co.cloudflareaccess.com"
+  },
   "containers": [
     {
       "class_name": "PipedriveMCPContainer",
