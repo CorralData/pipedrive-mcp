@@ -11,22 +11,6 @@
     "OIDC_ISSUER": "https://corraldata-co.cloudflareaccess.com",
     "PIPEDRIVE_COMPANY_DOMAIN": "corraldata"
   },
-  "containers": [
-    {
-      "class_name": "PipedriveMCPContainer",
-      "image": "./Dockerfile",
-      "max_instances": 1,
-      "instance_type": "basic"
-    }
-  ],
-  "durable_objects": {
-    "bindings": [
-      {
-        "class_name": "PipedriveMCPContainer",
-        "name": "PIPEDRIVE_MCP"
-      }
-    ]
-  },
   "kv_namespaces": [
     {
       "binding": "OAUTH_KV",
@@ -37,6 +21,10 @@
     {
       "new_sqlite_classes": ["PipedriveMCPContainer"],
       "tag": "v1"
+    },
+    {
+      "deleted_classes": ["PipedriveMCPContainer"],
+      "tag": "v2"
     }
   ]
 }
