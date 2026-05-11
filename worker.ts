@@ -1,44 +1,21 @@
-// Pipedrive MCP server - manual OAuth provider (no @cloudflare/workers-oauth-provider library)
+// Pipedrive MCP - pure Cloudflare Worker (no container)
+// - OAuth provider for claude.ai (PKCE, dynamic registration, CF Access OIDC backend)
+// - MCP server (Streamable HTTP transport) that calls Pipedrive REST API directly
 // Architecture:
 //   claude.ai -> /oauth/register (dynamic client registration)
 //   claude.ai -> /.well-known/oauth-authorization-server (metadata discovery)
 //   claude.ai -> /oauth/authorize -> redirects to CF Access OIDC
 //   CF Access -> /oauth/callback -> issues our authorization code
 //   claude.ai -> /oauth/token (exchanges code for access token, with PKCE)
-//   claude.ai -> /sse, /messages (with Bearer token, forwards to container)
-
-import { Container, getContainer } from "@cloudflare/containers";
+//   claude.ai -> /sse (POST JSON-RPC, Bearer protected) -> handled in-worker
 
 interface Env {
-  PIPEDRIVE_MCP: DurableObjectNamespace<PipedriveMCPContainer>;
   PIPEDRIVE_API_TOKEN: string;
   PIPEDRIVE_COMPANY_DOMAIN: string;
   OIDC_CLIENT_ID: string;
   OIDC_CLIENT_SECRET: string;
   OIDC_ISSUER: string;
   OAUTH_KV: KVNamespace;
-}
-
-export class PipedriveMCPContainer extends Container<Env> {
-  defaultPort = 8152;
-  sleepAfter = "30m";
-
-  override get envVars() {
-    return {
-      HOST: "0.0.0.0",
-      PORT: "8152",
-      TRANSPORT: "sse",
-      CONTAINER_MODE: "true",
-      PIPEDRIVE_API_TOKEN: this.env.PIPEDRIVE_API_TOKEN,
-      PIPEDRIVE_COMPANY_DOMAIN: this.env.PIPEDRIVE_COMPANY_DOMAIN,
-    };
-  }
-
-  // Auto-start the container before forwarding the request.
-  // Without this override, container.fetch() returns "Failed to start container".
-  override async fetch(request: Request): Promise<Response> {
-    return this.containerFetch(request);
-  }
 }
 
 function json(data: any, status = 200, extraHeaders: Record<string, string> = {}) {
@@ -59,55 +36,416 @@ async function logEvent(env: Env, event: Record<string, any>) {
     const log = await env.OAUTH_KV.get("__debug_log");
     const events = log ? JSON.parse(log) : [];
     events.unshift({ ts: new Date().toISOString(), ...event });
-    await env.OAUTH_KV.put("__debug_log", JSON.stringify(events.slice(0, 30)), { expirationTtl: 86400 });
+    await env.OAUTH_KV.put("__debug_log", JSON.stringify(events.slice(0, 50)), { expirationTtl: 86400 });
   } catch {}
 }
+
+// ============================================================================
+// Pipedrive API helpers
+// ============================================================================
+
+async function pdFetch(env: Env, method: string, path: string, body?: any): Promise<any> {
+  const url = new URL(`https://${env.PIPEDRIVE_COMPANY_DOMAIN}.pipedrive.com/v1${path}`);
+  url.searchParams.set("api_token", env.PIPEDRIVE_API_TOKEN);
+  const init: RequestInit = { method, headers: { "Content-Type": "application/json" } };
+  if (body !== undefined) init.body = JSON.stringify(body);
+  const res = await fetch(url.toString(), init);
+  const text = await res.text();
+  let data: any;
+  try { data = JSON.parse(text); } catch { data = { _raw: text }; }
+  if (!res.ok) {
+    return { error: true, status: res.status, body: data };
+  }
+  return data;
+}
+
+// ============================================================================
+// MCP tools
+// ============================================================================
+
+const TOOLS = [
+  {
+    name: "search_deals",
+    description: "Search for deals in Pipedrive by free-text term. Returns matching deals.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        term: { type: "string", description: "Search term (deal name or part of it). Required, min 2 chars." },
+        limit: { type: "number", description: "Max results (default 20, max 500).", default: 20 },
+      },
+      required: ["term"],
+    },
+  },
+  {
+    name: "get_deal",
+    description: "Get full details of a Pipedrive deal by ID.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "number", description: "Deal ID." } },
+      required: ["id"],
+    },
+  },
+  {
+    name: "list_deals",
+    description: "List Pipedrive deals with optional filters. Use 'status' to filter by all_not_deleted/open/won/lost/deleted. Use 'user_id' to filter by deal owner.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        status: { type: "string", description: "all_not_deleted (default), open, won, lost, or deleted." },
+        user_id: { type: "number", description: "Filter by owner user_id." },
+        limit: { type: "number", description: "Max results (default 50, max 500).", default: 50 },
+        start: { type: "number", description: "Pagination start (default 0).", default: 0 },
+      },
+    },
+  },
+  {
+    name: "create_deal",
+    description: "Create a new Pipedrive deal. Returns the created deal.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string", description: "Deal title. Required." },
+        value: { type: "number", description: "Deal value (number)." },
+        currency: { type: "string", description: "Currency code (e.g. USD)." },
+        person_id: { type: "number", description: "Linked person ID." },
+        org_id: { type: "number", description: "Linked organization ID." },
+        stage_id: { type: "number", description: "Pipeline stage ID." },
+        user_id: { type: "number", description: "Owner user ID." },
+        status: { type: "string", description: "open, won, lost, or deleted." },
+      },
+      required: ["title"],
+    },
+  },
+  {
+    name: "update_deal",
+    description: "Update fields on an existing Pipedrive deal. Pass only the fields to change.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "number", description: "Deal ID to update." },
+        title: { type: "string" },
+        value: { type: "number" },
+        currency: { type: "string" },
+        person_id: { type: "number" },
+        org_id: { type: "number" },
+        stage_id: { type: "number" },
+        user_id: { type: "number" },
+        status: { type: "string" },
+      },
+      required: ["id"],
+    },
+  },
+  {
+    name: "search_persons",
+    description: "Search for persons (contacts) by name, email, or phone.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        term: { type: "string", description: "Search term. Required, min 2 chars." },
+        fields: { type: "string", description: "Comma-separated fields to search: name, email, phone, custom_fields. Default: name,email,phone." },
+        limit: { type: "number", default: 20 },
+      },
+      required: ["term"],
+    },
+  },
+  {
+    name: "get_person",
+    description: "Get full details of a Pipedrive person by ID.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "number", description: "Person ID." } },
+      required: ["id"],
+    },
+  },
+  {
+    name: "create_person",
+    description: "Create a new person (contact). Returns the created person.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Person name. Required." },
+        email: { type: "string", description: "Primary email address." },
+        phone: { type: "string", description: "Primary phone number." },
+        org_id: { type: "number", description: "Linked organization ID." },
+        owner_id: { type: "number", description: "Owner user ID." },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "search_organizations",
+    description: "Search for organizations by name.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        term: { type: "string", description: "Search term. Required, min 2 chars." },
+        limit: { type: "number", default: 20 },
+      },
+      required: ["term"],
+    },
+  },
+  {
+    name: "get_organization",
+    description: "Get full details of an organization by ID.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "number", description: "Organization ID." } },
+      required: ["id"],
+    },
+  },
+  {
+    name: "create_organization",
+    description: "Create a new organization.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Organization name. Required." },
+        owner_id: { type: "number", description: "Owner user ID." },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "list_pipelines",
+    description: "List all Pipedrive pipelines.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "list_stages",
+    description: "List Pipedrive stages, optionally filtered by pipeline_id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        pipeline_id: { type: "number", description: "Filter by pipeline ID (optional)." },
+      },
+    },
+  },
+  {
+    name: "list_users",
+    description: "List all Pipedrive users.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "add_note",
+    description: "Add a note to a deal, person, or organization.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        content: { type: "string", description: "Note content (HTML supported). Required." },
+        deal_id: { type: "number", description: "Attach to deal." },
+        person_id: { type: "number", description: "Attach to person." },
+        org_id: { type: "number", description: "Attach to organization." },
+      },
+      required: ["content"],
+    },
+  },
+  {
+    name: "add_activity",
+    description: "Add an activity (task, call, meeting, etc.) optionally linked to a deal/person/org.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        subject: { type: "string", description: "Activity subject/title. Required." },
+        type: { type: "string", description: "Activity type key (e.g. 'call', 'meeting', 'task'). Default: 'task'." },
+        due_date: { type: "string", description: "YYYY-MM-DD." },
+        due_time: { type: "string", description: "HH:MM (24h)." },
+        duration: { type: "string", description: "HH:MM duration." },
+        deal_id: { type: "number" },
+        person_id: { type: "number" },
+        org_id: { type: "number" },
+        user_id: { type: "number" },
+        done: { type: "number", description: "0=not done, 1=done." },
+        note: { type: "string", description: "Activity note/body." },
+      },
+      required: ["subject"],
+    },
+  },
+];
+
+async function callTool(env: Env, name: string, args: Record<string, any>): Promise<any> {
+  switch (name) {
+    case "search_deals": {
+      const q = new URLSearchParams({ term: String(args.term), limit: String(args.limit ?? 20) });
+      return pdFetch(env, "GET", `/deals/search?${q}`);
+    }
+    case "get_deal":
+      return pdFetch(env, "GET", `/deals/${args.id}`);
+    case "list_deals": {
+      const q = new URLSearchParams();
+      q.set("status", String(args.status ?? "all_not_deleted"));
+      if (args.user_id !== undefined) q.set("user_id", String(args.user_id));
+      q.set("limit", String(args.limit ?? 50));
+      q.set("start", String(args.start ?? 0));
+      return pdFetch(env, "GET", `/deals?${q}`);
+    }
+    case "create_deal":
+      return pdFetch(env, "POST", `/deals`, args);
+    case "update_deal": {
+      const { id, ...body } = args;
+      return pdFetch(env, "PUT", `/deals/${id}`, body);
+    }
+    case "search_persons": {
+      const q = new URLSearchParams({ term: String(args.term), limit: String(args.limit ?? 20) });
+      if (args.fields) q.set("fields", String(args.fields));
+      return pdFetch(env, "GET", `/persons/search?${q}`);
+    }
+    case "get_person":
+      return pdFetch(env, "GET", `/persons/${args.id}`);
+    case "create_person": {
+      const body: any = { name: args.name };
+      if (args.email) body.email = [args.email];
+      if (args.phone) body.phone = [args.phone];
+      if (args.org_id) body.org_id = args.org_id;
+      if (args.owner_id) body.owner_id = args.owner_id;
+      return pdFetch(env, "POST", `/persons`, body);
+    }
+    case "search_organizations": {
+      const q = new URLSearchParams({ term: String(args.term), limit: String(args.limit ?? 20) });
+      return pdFetch(env, "GET", `/organizations/search?${q}`);
+    }
+    case "get_organization":
+      return pdFetch(env, "GET", `/organizations/${args.id}`);
+    case "create_organization":
+      return pdFetch(env, "POST", `/organizations`, args);
+    case "list_pipelines":
+      return pdFetch(env, "GET", `/pipelines`);
+    case "list_stages": {
+      const q = new URLSearchParams();
+      if (args.pipeline_id !== undefined) q.set("pipeline_id", String(args.pipeline_id));
+      const qs = q.toString();
+      return pdFetch(env, "GET", `/stages${qs ? "?" + qs : ""}`);
+    }
+    case "list_users":
+      return pdFetch(env, "GET", `/users`);
+    case "add_note": {
+      const body: any = { content: args.content };
+      if (args.deal_id) body.deal_id = args.deal_id;
+      if (args.person_id) body.person_id = args.person_id;
+      if (args.org_id) body.org_id = args.org_id;
+      return pdFetch(env, "POST", `/notes`, body);
+    }
+    case "add_activity": {
+      const body: any = {
+        subject: args.subject,
+        type: args.type ?? "task",
+      };
+      for (const k of ["due_date", "due_time", "duration", "deal_id", "person_id", "org_id", "user_id", "done", "note"]) {
+        if (args[k] !== undefined) body[k] = args[k];
+      }
+      return pdFetch(env, "POST", `/activities`, body);
+    }
+    default:
+      return { error: true, message: `Unknown tool: ${name}` };
+  }
+}
+
+// ============================================================================
+// MCP JSON-RPC handler (Streamable HTTP transport)
+// ============================================================================
+
+async function handleMcp(env: Env, req: any): Promise<any | null> {
+  const { jsonrpc, id, method, params } = req;
+  if (jsonrpc !== "2.0") {
+    return { jsonrpc: "2.0", id: id ?? null, error: { code: -32600, message: "Invalid Request: jsonrpc must be 2.0" } };
+  }
+
+  // Notifications (no id) get no response
+  const isNotification = id === undefined || id === null;
+
+  if (method === "initialize") {
+    return {
+      jsonrpc: "2.0", id,
+      result: {
+        protocolVersion: "2024-11-05",
+        capabilities: { tools: { listChanged: false } },
+        serverInfo: { name: "pipedrive-mcp", version: "2.0.0" },
+      },
+    };
+  }
+
+  if (method === "notifications/initialized" || method === "initialized") {
+    return null; // notification, no response
+  }
+
+  if (method === "tools/list") {
+    return { jsonrpc: "2.0", id, result: { tools: TOOLS } };
+  }
+
+  if (method === "tools/call") {
+    const name = params?.name;
+    const args = params?.arguments ?? {};
+    if (!name) return { jsonrpc: "2.0", id, error: { code: -32602, message: "Missing tool name" } };
+    try {
+      const result = await callTool(env, name, args);
+      return {
+        jsonrpc: "2.0", id,
+        result: {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+          isError: !!(result && (result as any).error),
+        },
+      };
+    } catch (e: any) {
+      return {
+        jsonrpc: "2.0", id,
+        result: {
+          content: [{ type: "text", text: `Tool execution error: ${e?.message || String(e)}` }],
+          isError: true,
+        },
+      };
+    }
+  }
+
+  if (method === "ping") {
+    return { jsonrpc: "2.0", id, result: {} };
+  }
+
+  if (isNotification) return null;
+  return { jsonrpc: "2.0", id, error: { code: -32601, message: `Method not found: ${method}` } };
+}
+
+// ============================================================================
+// Worker fetch handler
+// ============================================================================
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // ---------- Landing page ----------
+    // Landing page
     if (path === "/") {
       return new Response(
         `<!doctype html><html><body style="font-family: system-ui; padding: 40px; max-width: 600px; margin: auto;">
           <h1>Pipedrive MCP</h1>
           <p>CorralData internal Pipedrive MCP server. Add to claude.ai with URL <code>${url.origin}/sse</code>.</p>
+          <p>Pure-Worker implementation. No container.</p>
         </body></html>`,
         { headers: { "Content-Type": "text/html" } }
       );
     }
 
-    // ---------- Debug: recent events log ----------
+    // Debug
     if (path === "/__debug/log") {
       const log = await env.OAUTH_KV.get("__debug_log");
       return json(log ? JSON.parse(log) : []);
     }
-
     if (path === "/__debug/clear") {
       await env.OAUTH_KV.delete("__debug_log");
       return json({ cleared: true });
     }
-
-    // ---------- Debug: env var presence (no values exposed) ----------
     if (path === "/__debug") {
       return json({
         OIDC_CLIENT_ID_set: !!env.OIDC_CLIENT_ID,
         OIDC_CLIENT_SECRET_set: !!env.OIDC_CLIENT_SECRET,
-        OIDC_ISSUER_set: !!env.OIDC_ISSUER,
-        OIDC_ISSUER_value: env.OIDC_ISSUER || null, // not secret
-        OIDC_CLIENT_ID_len: env.OIDC_CLIENT_ID?.length || 0,
+        OIDC_ISSUER_value: env.OIDC_ISSUER || null,
         OIDC_CLIENT_SECRET_len: env.OIDC_CLIENT_SECRET?.length || 0,
         PIPEDRIVE_API_TOKEN_set: !!env.PIPEDRIVE_API_TOKEN,
-        PIPEDRIVE_COMPANY_DOMAIN_set: !!env.PIPEDRIVE_COMPANY_DOMAIN,
         PIPEDRIVE_COMPANY_DOMAIN_value: env.PIPEDRIVE_COMPANY_DOMAIN || null,
         OAUTH_KV_set: !!env.OAUTH_KV,
-        PIPEDRIVE_MCP_set: !!env.PIPEDRIVE_MCP,
       });
     }
 
-    // ---------- OAuth metadata discovery ----------
+    // OAuth metadata
     if (path === "/.well-known/oauth-authorization-server") {
       return json({
         issuer: url.origin,
@@ -131,7 +469,7 @@ export default {
       });
     }
 
-    // ---------- Dynamic client registration ----------
+    // Dynamic client registration
     if (path === "/oauth/register" && request.method === "POST") {
       let body: any;
       try { body = await request.json(); } catch { return json({ error: "invalid_request" }, 400); }
@@ -154,7 +492,7 @@ export default {
       }, 201);
     }
 
-    // ---------- Authorize: redirect to CF Access OIDC ----------
+    // Authorize -> CF Access OIDC
     if (path === "/oauth/authorize") {
       try {
         const p = url.searchParams;
@@ -169,29 +507,22 @@ export default {
         if (responseType !== "code") return new Response("Only response_type=code supported", { status: 400 });
         if (!clientId || !redirectUri) return new Response("Missing client_id or redirect_uri", { status: 400 });
 
-        // Verify client exists
         const clientStr = await env.OAUTH_KV.get(`client:${clientId}`);
         if (!clientStr) return new Response("Unknown client", { status: 400 });
         const client = JSON.parse(clientStr);
-
-        // Permissive redirect_uri check: must be in registered list (string match)
         if (!client.redirectUris.includes(redirectUri)) {
-          return new Response(`redirect_uri not registered. Registered: ${JSON.stringify(client.redirectUris)}, requested: ${redirectUri}`, { status: 400 });
+          return new Response(`redirect_uri not registered`, { status: 400 });
         }
 
-        // Sanity-check OIDC env vars
         if (!env.OIDC_ISSUER || !env.OIDC_CLIENT_ID) {
-          return new Response(`Server misconfigured: OIDC_ISSUER_set=${!!env.OIDC_ISSUER} OIDC_CLIENT_ID_set=${!!env.OIDC_CLIENT_ID}`, { status: 500 });
+          return new Response(`Server misconfigured`, { status: 500 });
         }
 
-        // Persist the original request keyed by an upstream state UUID
         const upstreamState = crypto.randomUUID();
         await env.OAUTH_KV.put(`upstream:${upstreamState}`, JSON.stringify({
           clientId, redirectUri, state, codeChallenge, codeChallengeMethod, scope,
         }), { expirationTtl: 600 });
 
-        // Redirect to CF Access OIDC authorize
-        // OIDC_ISSUER may have a trailing slash; strip it
         const issuer = env.OIDC_ISSUER.replace(/\/$/, "");
         const cfAuth = new URL(`${issuer}/cdn-cgi/access/sso/oidc/${env.OIDC_CLIENT_ID}/authorization`);
         cfAuth.searchParams.set("response_type", "code");
@@ -201,11 +532,11 @@ export default {
         cfAuth.searchParams.set("state", upstreamState);
         return Response.redirect(cfAuth.toString(), 302);
       } catch (e: any) {
-        return new Response(`/oauth/authorize error: ${e?.message || e}\nStack: ${e?.stack || "n/a"}`, { status: 500 });
+        return new Response(`/oauth/authorize error: ${e?.message || e}`, { status: 500 });
       }
     }
 
-    // ---------- Callback from CF Access ----------
+    // Callback from CF Access
     if (path === "/oauth/callback") {
       const code = url.searchParams.get("code");
       const upstreamState = url.searchParams.get("state");
@@ -216,7 +547,6 @@ export default {
       const reqInfo = JSON.parse(stored);
       await env.OAUTH_KV.delete(`upstream:${upstreamState}`);
 
-      // Exchange CF Access code for ID token
       const tokenRes = await fetch(`${env.OIDC_ISSUER}/cdn-cgi/access/sso/oidc/${env.OIDC_CLIENT_ID}/token`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -239,7 +569,6 @@ export default {
         userEmail = payload.email || payload.sub || "unknown";
       } catch {}
 
-      // Issue our authorization code, store the user info + PKCE
       const authCode = crypto.randomUUID() + "-" + crypto.randomUUID();
       await env.OAUTH_KV.put(`code:${authCode}`, JSON.stringify({
         clientId: reqInfo.clientId,
@@ -250,18 +579,16 @@ export default {
         userEmail,
       }), { expirationTtl: 600 });
 
-      // Redirect back to claude.ai
       const callback = new URL(reqInfo.redirectUri);
       callback.searchParams.set("code", authCode);
       if (reqInfo.state) callback.searchParams.set("state", reqInfo.state);
       return Response.redirect(callback.toString(), 302);
     }
 
-    // ---------- Token endpoint: exchange auth code for access token ----------
+    // Token exchange
     if (path === "/oauth/token" && request.method === "POST") {
       let formData: FormData;
       try { formData = await request.formData(); } catch {
-        await logEvent(env, { ep: "/oauth/token", error: "invalid_request_formdata" });
         return json({ error: "invalid_request" }, 400);
       }
       const grantType = formData.get("grant_type") as string;
@@ -272,44 +599,22 @@ export default {
         const redirectUri = formData.get("redirect_uri") as string;
         const clientId = formData.get("client_id") as string;
 
-        if (!code) {
-          await logEvent(env, { ep: "/oauth/token", error: "missing_code" });
-          return json({ error: "invalid_request" }, 400);
-        }
+        if (!code) return json({ error: "invalid_request" }, 400);
         const stored = await env.OAUTH_KV.get(`code:${code}`);
-        if (!stored) {
-          await logEvent(env, { ep: "/oauth/token", error: "code_not_found", code_prefix: code.slice(0, 8) });
-          return json({ error: "invalid_grant", error_description: "Code not found or expired" }, 400);
-        }
+        if (!stored) return json({ error: "invalid_grant", error_description: "Code not found or expired" }, 400);
         const codeInfo = JSON.parse(stored);
         await env.OAUTH_KV.delete(`code:${code}`);
 
-        if (clientId && clientId !== codeInfo.clientId) {
-          await logEvent(env, { ep: "/oauth/token", error: "client_mismatch", got: clientId, want: codeInfo.clientId });
-          return json({ error: "invalid_grant", error_description: "Client mismatch" }, 400);
-        }
-        if (redirectUri && redirectUri !== codeInfo.redirectUri) {
-          await logEvent(env, { ep: "/oauth/token", error: "redirect_mismatch", got: redirectUri, want: codeInfo.redirectUri });
-          return json({ error: "invalid_grant", error_description: "Redirect mismatch" }, 400);
-        }
+        if (clientId && clientId !== codeInfo.clientId) return json({ error: "invalid_grant", error_description: "Client mismatch" }, 400);
+        if (redirectUri && redirectUri !== codeInfo.redirectUri) return json({ error: "invalid_grant", error_description: "Redirect mismatch" }, 400);
 
-        // Verify PKCE
         if (codeInfo.codeChallenge) {
-          if (!codeVerifier) {
-            await logEvent(env, { ep: "/oauth/token", error: "missing_verifier" });
-            return json({ error: "invalid_grant", error_description: "Missing code_verifier" }, 400);
-          }
+          if (!codeVerifier) return json({ error: "invalid_grant", error_description: "Missing code_verifier" }, 400);
           if (codeInfo.codeChallengeMethod === "S256") {
             const calc = await sha256Base64Url(codeVerifier);
-            if (calc !== codeInfo.codeChallenge) {
-              await logEvent(env, { ep: "/oauth/token", error: "pkce_s256_mismatch", calc, want: codeInfo.codeChallenge });
-              return json({ error: "invalid_grant", error_description: "PKCE failed" }, 400);
-            }
+            if (calc !== codeInfo.codeChallenge) return json({ error: "invalid_grant", error_description: "PKCE failed" }, 400);
           } else {
-            if (codeVerifier !== codeInfo.codeChallenge) {
-              await logEvent(env, { ep: "/oauth/token", error: "pkce_plain_mismatch" });
-              return json({ error: "invalid_grant", error_description: "PKCE failed" }, 400);
-            }
+            if (codeVerifier !== codeInfo.codeChallenge) return json({ error: "invalid_grant", error_description: "PKCE failed" }, 400);
           }
         }
 
@@ -322,14 +627,6 @@ export default {
           issuedAt: Math.floor(Date.now() / 1000),
         }), { expirationTtl: expiresIn });
 
-        await logEvent(env, {
-          ep: "/oauth/token",
-          ok: true,
-          clientId: codeInfo.clientId,
-          userEmail: codeInfo.userEmail,
-          token_prefix: accessToken.slice(0, 8),
-        });
-
         return json({
           access_token: accessToken,
           token_type: "Bearer",
@@ -338,15 +635,13 @@ export default {
         });
       }
 
-      await logEvent(env, { ep: "/oauth/token", error: "unsupported_grant", grant: grantType });
       return json({ error: "unsupported_grant_type" }, 400);
     }
 
-    // ---------- API routes (protected by Bearer) ----------
-    if (path === "/sse" || path.startsWith("/sse/") || path.startsWith("/messages")) {
+    // MCP endpoint (protected by Bearer)
+    if (path === "/sse" || path.startsWith("/sse/") || path.startsWith("/messages") || path === "/mcp") {
       const authHeader = request.headers.get("Authorization") || "";
       if (!authHeader.startsWith("Bearer ")) {
-        await logEvent(env, { ep: path, method: request.method, error: "no_bearer" });
         return new Response("Unauthorized", {
           status: 401,
           headers: {
@@ -357,7 +652,6 @@ export default {
       const token = authHeader.substring(7);
       const stored = await env.OAUTH_KV.get(`token:${token}`);
       if (!stored) {
-        await logEvent(env, { ep: path, method: request.method, error: "invalid_token", token_prefix: token.slice(0, 8) });
         return new Response("Invalid token", {
           status: 401,
           headers: {
@@ -365,30 +659,39 @@ export default {
           },
         });
       }
-      // Forward to the container
-      try {
-        await logEvent(env, { ep: path, method: request.method, ok: true, token_prefix: token.slice(0, 8), action: "forwarding_to_container" });
-        const container = getContainer(env.PIPEDRIVE_MCP, "singleton");
-        const res = await container.fetch(request);
-        // If the container returned an error, capture the body for debugging
-        if (res.status >= 400) {
-          const cloned = res.clone();
-          let bodyPreview = "";
-          try { bodyPreview = (await cloned.text()).slice(0, 1000); } catch {}
-          await logEvent(env, {
-            ep: path,
-            method: request.method,
-            container_status: res.status,
-            container_content_type: res.headers.get("content-type") || null,
-            container_body_preview: bodyPreview,
-          });
-        } else {
-          await logEvent(env, { ep: path, method: request.method, container_status: res.status, container_content_type: res.headers.get("content-type") || null });
-        }
-        return res;
-      } catch (e: any) {
-        await logEvent(env, { ep: path, method: request.method, container_error: e?.message || String(e) });
-        return new Response(`Container error: ${e?.message || e}`, { status: 502 });
+
+      // GET with text/event-stream Accept (legacy SSE client probe). Return an empty stream that
+      // emits an endpoint event then closes — claude.ai will fall back to Streamable HTTP POST.
+      if (request.method === "GET") {
+        return new Response("", {
+          status: 405,
+          headers: {
+            "Allow": "POST",
+            "Content-Type": "text/plain",
+          },
+        });
+      }
+
+      if (request.method !== "POST") {
+        return new Response("Method not allowed", { status: 405 });
+      }
+
+      let body: any;
+      try { body = await request.json(); } catch {
+        return json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, 400);
+      }
+
+      // Body can be a single request or an array (batch)
+      if (Array.isArray(body)) {
+        const results = await Promise.all(body.map(req => handleMcp(env, req)));
+        const filtered = results.filter(r => r !== null);
+        if (filtered.length === 0) return new Response(null, { status: 202 });
+        return json(filtered);
+      } else {
+        const result = await handleMcp(env, body);
+        if (result === null) return new Response(null, { status: 202 });
+        await logEvent(env, { ep: "/sse", method: body?.method, ok: !result.error });
+        return json(result);
       }
     }
 
