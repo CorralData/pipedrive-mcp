@@ -21,7 +21,7 @@ interface Env {
 
 export class PipedriveMCPContainer extends Container<Env> {
   defaultPort = 8152;
-  sleepAfter = "5m";
+  sleepAfter = "30m";
 
   override get envVars() {
     return {
@@ -32,6 +32,12 @@ export class PipedriveMCPContainer extends Container<Env> {
       PIPEDRIVE_API_TOKEN: this.env.PIPEDRIVE_API_TOKEN,
       PIPEDRIVE_COMPANY_DOMAIN: this.env.PIPEDRIVE_COMPANY_DOMAIN,
     };
+  }
+
+  // Auto-start the container before forwarding the request.
+  // Without this override, container.fetch() returns "Failed to start container".
+  override async fetch(request: Request): Promise<Response> {
+    return this.containerFetch(request);
   }
 }
 
