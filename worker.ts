@@ -364,7 +364,21 @@ export default {
         await logEvent(env, { ep: path, method: request.method, ok: true, token_prefix: token.slice(0, 8), action: "forwarding_to_container" });
         const container = getContainer(env.PIPEDRIVE_MCP, "singleton");
         const res = await container.fetch(request);
-        await logEvent(env, { ep: path, method: request.method, container_status: res.status, container_content_type: res.headers.get("content-type") || null });
+        // If the container returned an error, capture the body for debugging
+        if (res.status >= 400) {
+          const cloned = res.clone();
+          let bodyPreview = "";
+          try { bodyPreview = (await cloned.text()).slice(0, 1000); } catch {}
+          await logEvent(env, {
+            ep: path,
+            method: request.method,
+            container_status: res.status,
+            container_content_type: res.headers.get("content-type") || null,
+            container_body_preview: bodyPreview,
+          });
+        } else {
+          await logEvent(env, { ep: path, method: request.method, container_status: res.status, container_content_type: res.headers.get("content-type") || null });
+        }
         return res;
       } catch (e: any) {
         await logEvent(env, { ep: path, method: request.method, container_error: e?.message || String(e) });
