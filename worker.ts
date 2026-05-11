@@ -48,6 +48,15 @@ async function sha256Base64Url(input: string): Promise<string> {
     .replace(/\+/g, "-").replace(/\//g, "_").replace(/=/g, "");
 }
 
+async function logEvent(env: Env, event: Record<string, any>) {
+  try {
+    const log = await env.OAUTH_KV.get("__debug_log");
+    const events = log ? JSON.parse(log) : [];
+    events.unshift({ ts: new Date().toISOString(), ...event });
+    await env.OAUTH_KV.put("__debug_log", JSON.stringify(events.slice(0, 30)), { expirationTtl: 86400 });
+  } catch {}
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -62,6 +71,17 @@ export default {
         </body></html>`,
         { headers: { "Content-Type": "text/html" } }
       );
+    }
+
+    // ---------- Debug: recent events log ----------
+    if (path === "/__debug/log") {
+      const log = await env.OAUTH_KV.get("__debug_log");
+      return json(log ? JSON.parse(log) : []);
+    }
+
+    if (path === "/__debug/clear") {
+      await env.OAUTH_KV.delete("__debug_log");
+      return json({ cleared: true });
     }
 
     // ---------- Debug: env var presence (no values exposed) ----------
@@ -234,7 +254,10 @@ export default {
     // ---------- Token endpoint: exchange auth code for access token ----------
     if (path === "/oauth/token" && request.method === "POST") {
       let formData: FormData;
-      try { formData = await request.formData(); } catch { return json({ error: "invalid_request" }, 400); }
+      try { formData = await request.formData(); } catch {
+        await logEvent(env, { ep: "/oauth/token", error: "invalid_request_formdata" });
+        return json({ error: "invalid_request" }, 400);
+      }
       const grantType = formData.get("grant_type") as string;
 
       if (grantType === "authorization_code") {
@@ -243,23 +266,44 @@ export default {
         const redirectUri = formData.get("redirect_uri") as string;
         const clientId = formData.get("client_id") as string;
 
-        if (!code) return json({ error: "invalid_request" }, 400);
+        if (!code) {
+          await logEvent(env, { ep: "/oauth/token", error: "missing_code" });
+          return json({ error: "invalid_request" }, 400);
+        }
         const stored = await env.OAUTH_KV.get(`code:${code}`);
-        if (!stored) return json({ error: "invalid_grant", error_description: "Code not found or expired" }, 400);
+        if (!stored) {
+          await logEvent(env, { ep: "/oauth/token", error: "code_not_found", code_prefix: code.slice(0, 8) });
+          return json({ error: "invalid_grant", error_description: "Code not found or expired" }, 400);
+        }
         const codeInfo = JSON.parse(stored);
         await env.OAUTH_KV.delete(`code:${code}`);
 
-        if (clientId && clientId !== codeInfo.clientId) return json({ error: "invalid_grant", error_description: "Client mismatch" }, 400);
-        if (redirectUri && redirectUri !== codeInfo.redirectUri) return json({ error: "invalid_grant", error_description: "Redirect mismatch" }, 400);
+        if (clientId && clientId !== codeInfo.clientId) {
+          await logEvent(env, { ep: "/oauth/token", error: "client_mismatch", got: clientId, want: codeInfo.clientId });
+          return json({ error: "invalid_grant", error_description: "Client mismatch" }, 400);
+        }
+        if (redirectUri && redirectUri !== codeInfo.redirectUri) {
+          await logEvent(env, { ep: "/oauth/token", error: "redirect_mismatch", got: redirectUri, want: codeInfo.redirectUri });
+          return json({ error: "invalid_grant", error_description: "Redirect mismatch" }, 400);
+        }
 
         // Verify PKCE
         if (codeInfo.codeChallenge) {
-          if (!codeVerifier) return json({ error: "invalid_grant", error_description: "Missing code_verifier" }, 400);
+          if (!codeVerifier) {
+            await logEvent(env, { ep: "/oauth/token", error: "missing_verifier" });
+            return json({ error: "invalid_grant", error_description: "Missing code_verifier" }, 400);
+          }
           if (codeInfo.codeChallengeMethod === "S256") {
             const calc = await sha256Base64Url(codeVerifier);
-            if (calc !== codeInfo.codeChallenge) return json({ error: "invalid_grant", error_description: "PKCE failed" }, 400);
+            if (calc !== codeInfo.codeChallenge) {
+              await logEvent(env, { ep: "/oauth/token", error: "pkce_s256_mismatch", calc, want: codeInfo.codeChallenge });
+              return json({ error: "invalid_grant", error_description: "PKCE failed" }, 400);
+            }
           } else {
-            if (codeVerifier !== codeInfo.codeChallenge) return json({ error: "invalid_grant", error_description: "PKCE failed" }, 400);
+            if (codeVerifier !== codeInfo.codeChallenge) {
+              await logEvent(env, { ep: "/oauth/token", error: "pkce_plain_mismatch" });
+              return json({ error: "invalid_grant", error_description: "PKCE failed" }, 400);
+            }
           }
         }
 
@@ -272,6 +316,14 @@ export default {
           issuedAt: Math.floor(Date.now() / 1000),
         }), { expirationTtl: expiresIn });
 
+        await logEvent(env, {
+          ep: "/oauth/token",
+          ok: true,
+          clientId: codeInfo.clientId,
+          userEmail: codeInfo.userEmail,
+          token_prefix: accessToken.slice(0, 8),
+        });
+
         return json({
           access_token: accessToken,
           token_type: "Bearer",
@@ -280,6 +332,7 @@ export default {
         });
       }
 
+      await logEvent(env, { ep: "/oauth/token", error: "unsupported_grant", grant: grantType });
       return json({ error: "unsupported_grant_type" }, 400);
     }
 
@@ -287,6 +340,7 @@ export default {
     if (path === "/sse" || path.startsWith("/sse/") || path.startsWith("/messages")) {
       const authHeader = request.headers.get("Authorization") || "";
       if (!authHeader.startsWith("Bearer ")) {
+        await logEvent(env, { ep: path, method: request.method, error: "no_bearer" });
         return new Response("Unauthorized", {
           status: 401,
           headers: {
@@ -297,6 +351,7 @@ export default {
       const token = authHeader.substring(7);
       const stored = await env.OAUTH_KV.get(`token:${token}`);
       if (!stored) {
+        await logEvent(env, { ep: path, method: request.method, error: "invalid_token", token_prefix: token.slice(0, 8) });
         return new Response("Invalid token", {
           status: 401,
           headers: {
@@ -305,8 +360,16 @@ export default {
         });
       }
       // Forward to the container
-      const container = getContainer(env.PIPEDRIVE_MCP, "singleton");
-      return container.fetch(request);
+      try {
+        await logEvent(env, { ep: path, method: request.method, ok: true, token_prefix: token.slice(0, 8), action: "forwarding_to_container" });
+        const container = getContainer(env.PIPEDRIVE_MCP, "singleton");
+        const res = await container.fetch(request);
+        await logEvent(env, { ep: path, method: request.method, container_status: res.status, container_content_type: res.headers.get("content-type") || null });
+        return res;
+      } catch (e: any) {
+        await logEvent(env, { ep: path, method: request.method, container_error: e?.message || String(e) });
+        return new Response(`Container error: ${e?.message || e}`, { status: 502 });
+      }
     }
 
     return new Response("Not found", { status: 404 });
