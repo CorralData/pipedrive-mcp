@@ -13,7 +13,7 @@ interface Env {
   PIPEDRIVE_API_TOKEN: string;
   PIPEDRIVE_COMPANY_DOMAIN: string;
   OIDC_CLIENT_ID: string;
-  OIDC_CLIENT_SECRET: string;
+ OIDC_CLIENT_SECRET: string;
   OIDC_ISSUER: string;
   OAUTH_KV: KVNamespace;
 }
@@ -260,6 +260,46 @@ const TOOLS = [
       required: ["subject"],
     },
   },
+  {
+    name: "list_activities",
+    description: "List/find activities in Pipedrive. Optionally filter by done status or owner. For a specific deal's activities, pass deal_id.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        done: { type: "number", description: "Filter by completion: 0=not done, 1=done. Omit for all." },
+        user_id: { type: "number", description: "Filter by owner user_id." },
+        deal_id: { type: "number", description: "Return activities for this deal instead of all activities." },
+        limit: { type: "number", description: "Max results (default 100, max 500).", default: 100 },
+        start: { type: "number", description: "Pagination start (default 0).", default: 0 },
+      },
+    },
+  },
+  {
+    name: "get_activity",
+    description: "Get full details of a single Pipedrive activity by ID.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "number", description: "Activity ID." } },
+      required: ["id"],
+    },
+  },
+  {
+    name: "update_activity",
+    description: "Update fields on an existing Pipedrive activity, e.g. mark it done or add a note. Pass only the fields to change.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "number", description: "Activity ID to update. Required." },
+        done: { type: "number", description: "0=not done, 1=done." },
+        subject: { type: "string" },
+        note: { type: "string" },
+        due_date: { type: "string", description: "YYYY-MM-DD." },
+        due_time: { type: "string", description: "HH:MM (24h)." },
+        type: { type: "string" },
+      },
+      required: ["id"],
+    },
+  },
 ];
 
 async function callTool(env: Env, name: string, args: Record<string, any>): Promise<any> {
@@ -333,6 +373,21 @@ async function callTool(env: Env, name: string, args: Record<string, any>): Prom
         if (args[k] !== undefined) body[k] = args[k];
       }
       return pdFetch(env, "POST", `/activities`, body);
+    }
+    case "list_activities": {
+      const q = new URLSearchParams();
+      if (args.done !== undefined) q.set("done", String(args.done));
+      if (args.user_id !== undefined) q.set("user_id", String(args.user_id));
+      q.set("limit", String(args.limit ?? 100));
+      q.set("start", String(args.start ?? 0));
+      const base = args.deal_id !== undefined ? `/deals/${args.deal_id}/activities` : `/activities`;
+      return pdFetch(env, "GET", `${base}?${q}`);
+    }
+    case "get_activity":
+      return pdFetch(env, "GET", `/activities/${args.id}`);
+    case "update_activity": {
+      const { id, ...body } = args;
+      return pdFetch(env, "PUT", `/activities/${id}`, body);
     }
     default:
       return { error: true, message: `Unknown tool: ${name}` };
