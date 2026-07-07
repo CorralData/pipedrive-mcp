@@ -228,6 +228,8 @@ const TOOLS = [
   },
   { name: "list_deal_fields", description: "List Pipedrive deal fields, including the Label field's available options (id + label text) needed for setting a deal's label via update_deal.", inputSchema: { type: "object", properties: {} } },
   { name: "update_deal_field", description: "Update a Pipedrive deal field's options (e.g. add new Label options). IMPORTANT: options must be the FULL desired list - any existing option you omit will be deleted. Fetch current options via list_deal_fields first, then pass that full array plus your new option(s) appended (new options omit 'id').", inputSchema: { type: "object", properties: { id: { type: "number", description: "Deal field ID (e.g. the Label field's id from list_deal_fields). Required." }, options: { type: "array", description: "Full array of option objects: { id?: number, label: string, color?: string }.", items: { type: "object", properties: { id: { type: "number" }, label: { type: "string" }, color: { type: "string" } }, required: ["label"] } } }, required: ["id", "options"] } },
+  { name: "update_organization", description: "Update fields on an existing Pipedrive organization, including custom fields (pass the custom field's hashed key as a property - see the key returned by create_organization_field). Pass only the fields to change.", inputSchema: { type: "object", properties: { id: { type: "number", description: "Organization ID to update. Required." }, name: { type: "string" }, owner_id: { type: "number" } }, required: ["id"], additionalProperties: true } },
+  { name: "create_organization_field", description: "Create a new custom field on Organizations (e.g. a Renewal Date field). Returns the created field including its 'key' - use that key as a property name when calling update_organization to set values on organizations.", inputSchema: { type: "object", properties: { name: { type: "string", description: "Field name, e.g. 'Renewal Date'. Required." }, field_type: { type: "string", description: "Pipedrive field type: date, varchar, text, double, enum, etc. Required." } }, required: ["name", "field_type"] } },
   {
     name: "add_note",
     description: "Add a note to a deal, person, or organization.",
@@ -350,6 +352,8 @@ async function callTool(env: Env, name: string, args: Record<string, any>): Prom
       return pdFetch(env, "GET", `/organizations/${args.id}`);
     case "create_organization":
       return pdFetch(env, "POST", `/organizations`, args);
+    case "update_organization": { const { id, ...body } = args; return pdFetch(env, "PUT", `/organizations/${id}`, body); }
+    case "create_organization_field": return pdFetch(env, "POST", `/organizationFields`, args);
     case "list_pipelines":
       return pdFetch(env, "GET", `/pipelines`);
     case "list_stages": {
