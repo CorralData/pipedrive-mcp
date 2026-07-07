@@ -297,6 +297,38 @@ const TOOLS = [
     },
   },
   {
+    name: "list_notes",
+    description: "List notes in Pipedrive, optionally filtered by deal_id, person_id, or org_id. Use before delete_note to find the note's ID.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        deal_id: { type: "number", description: "Filter to notes on this deal." },
+        person_id: { type: "number", description: "Filter to notes on this person." },
+        org_id: { type: "number", description: "Filter to notes on this organization." },
+        start: { type: "number", description: "Pagination start (default 0).", default: 0 },
+        limit: { type: "number", description: "Max results (default 100, max 500).", default: 100 },
+      },
+    },
+  },
+  {
+    name: "get_note",
+    description: "Get full details of a single Pipedrive note by ID.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "number", description: "Note ID." } },
+      required: ["id"],
+    },
+  },
+  {
+    name: "delete_note",
+    description: "Permanently delete a note from Pipedrive by ID. This cannot be undone - use list_notes first to confirm the correct note ID.",
+    inputSchema: {
+      type: "object",
+      properties: { id: { type: "number", description: "Note ID to delete. Required." } },
+      required: ["id"],
+    },
+  },
+  {
     name: "add_activity",
     description: "Add an activity (task, call, meeting, etc.) optionally linked to a deal/person/org.",
     inputSchema: {
@@ -444,6 +476,19 @@ async function callTool(env: Env, name: string, args: Record<string, any>): Prom
       if (args.org_id) body.org_id = args.org_id;
       return pdFetch(env, "POST", `/notes`, body);
     }
+    case "list_notes": {
+      const q = new URLSearchParams();
+      if (args.deal_id !== undefined) q.set("deal_id", String(args.deal_id));
+      if (args.person_id !== undefined) q.set("person_id", String(args.person_id));
+      if (args.org_id !== undefined) q.set("org_id", String(args.org_id));
+      q.set("start", String(args.start ?? 0));
+      q.set("limit", String(args.limit ?? 100));
+      return pdFetch(env, "GET", `/notes?${q}`);
+    }
+    case "get_note":
+      return pdFetch(env, "GET", `/notes/${args.id}`);
+    case "delete_note":
+      return pdFetch(env, "DELETE", `/notes/${args.id}`);
     case "add_activity": {
       const body: any = {
         subject: args.subject,
