@@ -131,6 +131,7 @@ const TOOLS = [
         stage_id: { type: "number" },
         user_id: { type: "number" },
         status: { type: "string" },
+        label: { type: "number", description: "Label ID to set on the deal (single value; see GET /dealFields for available label option IDs)." },
       },
       required: ["id"],
     },
@@ -225,6 +226,7 @@ const TOOLS = [
     description: "List all Pipedrive users.",
     inputSchema: { type: "object", properties: {} },
   },
+  { name: "list_deal_fields", description: "List Pipedrive deal fields, including the Label field's available options (id + label text) needed for setting a deal's label via update_deal.", inputSchema: { type: "object", properties: {} } },
   {
     name: "add_note",
     description: "Add a note to a deal, person, or organization.",
@@ -357,6 +359,8 @@ async function callTool(env: Env, name: string, args: Record<string, any>): Prom
     }
     case "list_users":
       return pdFetch(env, "GET", `/users`);
+    case "list_deal_fields":
+      return pdFetch(env, "GET", `/dealFields`);
     case "add_note": {
       const body: any = { content: args.content };
       if (args.deal_id) body.deal_id = args.deal_id;
