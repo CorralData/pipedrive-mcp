@@ -227,6 +227,7 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {} },
   },
   { name: "list_deal_fields", description: "List Pipedrive deal fields, including the Label field's available options (id + label text) needed for setting a deal's label via update_deal.", inputSchema: { type: "object", properties: {} } },
+  { name: "update_deal_field", description: "Update a Pipedrive deal field's options (e.g. add new Label options). IMPORTANT: options must be the FULL desired list - any existing option you omit will be deleted. Fetch current options via list_deal_fields first, then pass that full array plus your new option(s) appended (new options omit 'id').", inputSchema: { type: "object", properties: { id: { type: "number", description: "Deal field ID (e.g. the Label field's id from list_deal_fields). Required." }, options: { type: "array", description: "Full array of option objects: { id?: number, label: string, color?: string }.", items: { type: "object", properties: { id: { type: "number" }, label: { type: "string" }, color: { type: "string" } }, required: ["label"] } } }, required: ["id", "options"] } },
   {
     name: "add_note",
     description: "Add a note to a deal, person, or organization.",
@@ -361,6 +362,10 @@ async function callTool(env: Env, name: string, args: Record<string, any>): Prom
       return pdFetch(env, "GET", `/users`);
     case "list_deal_fields":
       return pdFetch(env, "GET", `/dealFields`);
+    case "update_deal_field": {
+      const { id, ...body } = args;
+      return pdFetch(env, "PUT", `/dealFields/${id}`, body);
+    }
     case "add_note": {
       const body: any = { content: args.content };
       if (args.deal_id) body.deal_id = args.deal_id;
