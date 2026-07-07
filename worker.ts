@@ -359,12 +359,12 @@ const TOOLS = [
   },
   {
     name: "create_webhook",
-    description: "Create a Pipedrive webhook subscription. Pipedrive will POST to subscription_url whenever event_object/event_action occurs (e.g. object='activity', action='updated').",
+    description: "Create a Pipedrive webhook subscription. Pipedrive will POST to subscription_url whenever event_object/event_action occurs (e.g. object='activity', action='change').",
     inputSchema: {
       type: "object",
       properties: {
         subscription_url: { type: "string", description: "Full URL Pipedrive should POST to. Required." },
-        event_action: { type: "string", description: "e.g. added, updated, deleted, or *. Required." },
+        event_action: { type: "string", description: "Pipedrive v2 naming: create, change, delete, or *. Required." },
         event_object: { type: "string", description: "e.g. activity, deal, person, or *. Required." },
         http_auth_user: { type: "string", description: "Optional HTTP basic auth username Pipedrive will send." },
         http_auth_password: { type: "string", description: "Optional HTTP basic auth password Pipedrive will send." },
@@ -573,7 +573,7 @@ export default {
       const subscriptionUrl = `${url.origin}/webhooks/pipedrive/activity?secret=${encodeURIComponent(env.PIPEDRIVE_ACTIVITY_WEBHOOK_SECRET)}`;
       const result = await pdFetch(env, "POST", "/webhooks", {
         subscription_url: subscriptionUrl,
-        event_action: "updated",
+        event_action: "change",
         event_object: "activity",
       });
       return json({ ok: !(result && result.error), result });
