@@ -562,6 +562,23 @@ export default {
     }
     if (path === "/webhooks/zendesk" && request.method === "POST") { const secret = url.searchParams.get("secret") || ""; if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) { return new Response("Unauthorized", { status: 401 }); } let payload: any = {}; try { payload = await request.json(); } catch { return json({ error: "invalid_json" }, 400); } const ticketId = payload.ticket_id; const subject = payload.subject || "Zendesk ticket"; const email = payload.requester_email; const ticketUrl = payload.ticket_url; const personMatch = email ? await findPersonByExactEmail(env, String(email)) : null; const activityBody: any = { subject: `Zendesk ticket #${ticketId}: ${subject}`, type: "task", note: `${ticketUrl || ""} - Requester: ${payload.requester_name || ""} <${email || ""}>` }; if (personMatch) { activityBody.person_id = personMatch.id; const orgId = (personMatch.organization && personMatch.organization.id) || personMatch.org_id; if (orgId) activityBody.org_id = orgId; } const result = await pdFetch(env, "POST", "/activities", activityBody); await logEvent(env, { ep: "/webhooks/zendesk", ticketId, matched: !!personMatch, ok: !(result && result.error) }); return json({ ok: !(result && result.error), matched: !!personMatch }); }
 
+    // One-time setup helper: registers the Pipedrive webhook subscription (activity updated)
+    // pointing at /webhooks/pipedrive/activity. Safe to call more than once (Pipedrive just
+    // creates another subscription); intended to be run once after deploy, not on a schedule.
+    if (path === "/__admin/setup-pipedrive-webhook" && request.method === "POST") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.PIPEDRIVE_ACTIVITY_WEBHOOK_SECRET || secret !== env.PIPEDRIVE_ACTIVITY_WEBHOOK_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const subscriptionUrl = `${url.origin}/webhooks/pipedrive/activity?secret=${encodeURIComponent(env.PIPEDRIVE_ACTIVITY_WEBHOOK_SECRET)}`;
+      const result = await pdFetch(env, "POST", "/webhooks", {
+        subscription_url: subscriptionUrl,
+        event_action: "updated",
+        event_object: "activity",
+      });
+      return json({ ok: !(result && result.error), result });
+    }
+
     // Reverse sync: Pipedrive activity marked done -> mark the linked Zendesk ticket solved.
     // Activities created by /webhooks/zendesk have subject "Zendesk ticket #<id>: <title>";
     // we parse the ticket id back out of that rather than needing a separate mapping store.
