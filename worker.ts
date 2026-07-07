@@ -16,6 +16,8 @@ interface Env {
  OIDC_CLIENT_SECRET: string;
   OIDC_ISSUER: string;
   OAUTH_KV: KVNamespace;
+  ZENDESK_WEBHOOK_SECRET: string;
+  ZENDESK_API_TOKEN: string;
 }
 
 function json(data: any, status = 200, extraHeaders: Record<string, string> = {}) {
@@ -491,6 +493,7 @@ export default {
         { headers: { "Content-Type": "text/html" } }
       );
     }
+    if (path === "/webhooks/zendesk" && request.method === "POST") { const secret = url.searchParams.get("secret") || ""; if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) { return new Response("Unauthorized", { status: 401 }); } let payload: any = {}; try { payload = await request.json(); } catch { return json({ error: "invalid_json" }, 400); } const ticketId = payload.ticket_id; const subject = payload.subject || "Zendesk ticket"; const email = payload.requester_email; const ticketUrl = payload.ticket_url; let personMatch: any = null; if (email) { const searchRes = await pdFetch(env, "GET", `/persons/search?${new URLSearchParams({ term: String(email), fields: "email", limit: "1" })}`); personMatch = searchRes?.data?.items?.[0]?.item || null; } const activityBody: any = { subject: `Zendesk ticket #${ticketId}: ${subject}`, type: "task", note: `${ticketUrl || ""} - Requester: ${payload.requester_name || ""} <${email || ""}>` }; if (personMatch) { activityBody.person_id = personMatch.id; const orgId = (personMatch.organization && personMatch.organization.id) || personMatch.org_id; if (orgId) activityBody.org_id = orgId; } const result = await pdFetch(env, "POST", "/activities", activityBody); await logEvent(env, { ep: "/webhooks/zendesk", ticketId, matched: !!personMatch, ok: !(result && result.error) }); return json({ ok: !(result && result.error), matched: !!personMatch }); }
 
     // Debug
     if (path === "/__debug/log") {
