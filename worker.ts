@@ -18,7 +18,11 @@ interface Env {
   OAUTH_KV: KVNamespace;
   ZENDESK_WEBHOOK_SECRET: string;
   ZENDESK_API_TOKEN: string;
+  PIPEDRIVE_ACTIVITY_WEBHOOK_SECRET: string;
 }
+
+const ZENDESK_SUBDOMAIN = "corraldata";
+const ZENDESK_AGENT_EMAIL = "alex@corraldata.com";
 
 function json(data: any, status = 200, extraHeaders: Record<string, string> = {}) {
   return new Response(JSON.stringify(data), {
@@ -59,6 +63,52 @@ async function pdFetch(env: Env, method: string, path: string, body?: any): Prom
     return { error: true, status: res.status, body: data };
   }
   return data;
+}
+
+// ============================================================================
+// Zendesk API helper
+// ============================================================================
+
+async function zendeskFetch(env: Env, method: string, path: string, body?: any): Promise<any> {
+  const url = `https://${ZENDESK_SUBDOMAIN}.zendesk.com${path}`;
+  const auth = btoa(`${ZENDESK_AGENT_EMAIL}/token:${env.ZENDESK_API_TOKEN}`);
+  const init: RequestInit = {
+    method,
+    headers: { "Content-Type": "application/json", "Authorization": `Basic ${auth}` },
+  };
+  if (body !== undefined) init.body = JSON.stringify(body);
+  const res = await fetch(url, init);
+  const text = await res.text();
+  let data: any;
+  try { data = JSON.parse(text); } catch { data = { _raw: text }; }
+  if (!res.ok) {
+    return { error: true, status: res.status, body: data };
+  }
+  return data;
+}
+
+// Given a search term (email), find the Pipedrive person whose primary or listed
+// email address exactly (case-insensitively) matches. Returns null if no exact match,
+// rather than falling back to a fuzzy/first result (avoids mismatching to unrelated contacts).
+async function findPersonByExactEmail(env: Env, email: string): Promise<any | null> {
+  const target = email.trim().toLowerCase();
+  const searchRes = await pdFetch(
+    env,
+    "GET",
+    `/persons/search?${new URLSearchParams({ term: email, fields: "email", limit: "10" })}`
+  );
+  const items = searchRes?.data?.items || [];
+  for (const it of items) {
+    const person = it.item;
+    if (!person) continue;
+    const emails: string[] = [];
+    if (person.primary_email) emails.push(person.primary_email);
+    if (Array.isArray(person.emails)) emails.push(...person.emails);
+    if (emails.some((e: string) => String(e).trim().toLowerCase() === target)) {
+      return person;
+    }
+  }
+  return null;
 }
 
 // ============================================================================
@@ -307,6 +357,21 @@ const TOOLS = [
       required: ["id"],
     },
   },
+  {
+    name: "create_webhook",
+    description: "Create a Pipedrive webhook subscription. Pipedrive will POST to subscription_url whenever event_object/event_action occurs (e.g. object='activity', action='updated').",
+    inputSchema: {
+      type: "object",
+      properties: {
+        subscription_url: { type: "string", description: "Full URL Pipedrive should POST to. Required." },
+        event_action: { type: "string", description: "e.g. added, updated, deleted, or *. Required." },
+        event_object: { type: "string", description: "e.g. activity, deal, person, or *. Required." },
+        http_auth_user: { type: "string", description: "Optional HTTP basic auth username Pipedrive will send." },
+        http_auth_password: { type: "string", description: "Optional HTTP basic auth password Pipedrive will send." },
+      },
+      required: ["subscription_url", "event_action", "event_object"],
+    },
+  },
 ];
 
 async function callTool(env: Env, name: string, args: Record<string, any>): Promise<any> {
@@ -404,6 +469,8 @@ async function callTool(env: Env, name: string, args: Record<string, any>): Prom
       const { id, ...body } = args;
       return pdFetch(env, "PUT", `/activities/${id}`, body);
     }
+    case "create_webhook":
+      return pdFetch(env, "POST", `/webhooks`, args);
     default:
       return { error: true, message: `Unknown tool: ${name}` };
   }
@@ -493,7 +560,31 @@ export default {
         { headers: { "Content-Type": "text/html" } }
       );
     }
-    if (path === "/webhooks/zendesk" && request.method === "POST") { const secret = url.searchParams.get("secret") || ""; if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) { return new Response("Unauthorized", { status: 401 }); } let payload: any = {}; try { payload = await request.json(); } catch { return json({ error: "invalid_json" }, 400); } const ticketId = payload.ticket_id; const subject = payload.subject || "Zendesk ticket"; const email = payload.requester_email; const ticketUrl = payload.ticket_url; let personMatch: any = null; if (email) { const searchRes = await pdFetch(env, "GET", `/persons/search?${new URLSearchParams({ term: String(email), fields: "email", limit: "1" })}`); personMatch = searchRes?.data?.items?.[0]?.item || null; } const activityBody: any = { subject: `Zendesk ticket #${ticketId}: ${subject}`, type: "task", note: `${ticketUrl || ""} - Requester: ${payload.requester_name || ""} <${email || ""}>` }; if (personMatch) { activityBody.person_id = personMatch.id; const orgId = (personMatch.organization && personMatch.organization.id) || personMatch.org_id; if (orgId) activityBody.org_id = orgId; } const result = await pdFetch(env, "POST", "/activities", activityBody); await logEvent(env, { ep: "/webhooks/zendesk", ticketId, matched: !!personMatch, ok: !(result && result.error) }); return json({ ok: !(result && result.error), matched: !!personMatch }); }
+    if (path === "/webhooks/zendesk" && request.method === "POST") { const secret = url.searchParams.get("secret") || ""; if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) { return new Response("Unauthorized", { status: 401 }); } let payload: any = {}; try { payload = await request.json(); } catch { return json({ error: "invalid_json" }, 400); } const ticketId = payload.ticket_id; const subject = payload.subject || "Zendesk ticket"; const email = payload.requester_email; const ticketUrl = payload.ticket_url; const personMatch = email ? await findPersonByExactEmail(env, String(email)) : null; const activityBody: any = { subject: `Zendesk ticket #${ticketId}: ${subject}`, type: "task", note: `${ticketUrl || ""} - Requester: ${payload.requester_name || ""} <${email || ""}>` }; if (personMatch) { activityBody.person_id = personMatch.id; const orgId = (personMatch.organization && personMatch.organization.id) || personMatch.org_id; if (orgId) activityBody.org_id = orgId; } const result = await pdFetch(env, "POST", "/activities", activityBody); await logEvent(env, { ep: "/webhooks/zendesk", ticketId, matched: !!personMatch, ok: !(result && result.error) }); return json({ ok: !(result && result.error), matched: !!personMatch }); }
+
+    // Reverse sync: Pipedrive activity marked done -> mark the linked Zendesk ticket solved.
+    // Activities created by /webhooks/zendesk have subject "Zendesk ticket #<id>: <title>";
+    // we parse the ticket id back out of that rather than needing a separate mapping store.
+    if (path === "/webhooks/pipedrive/activity" && request.method === "POST") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.PIPEDRIVE_ACTIVITY_WEBHOOK_SECRET || secret !== env.PIPEDRIVE_ACTIVITY_WEBHOOK_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      let payload: any = {};
+      try { payload = await request.json(); } catch { return json({ error: "invalid_json" }, 400); }
+      const current = payload.current || payload.data || {};
+      const isDone = current.done === true || current.done === 1 || current.done === "1";
+      const subject: string = current.subject || "";
+      const m = subject.match(/Zendesk ticket #(\d+):/);
+      if (!isDone || !m) {
+        await logEvent(env, { ep: "/webhooks/pipedrive/activity", activityId: current.id, skipped: true, ok: true });
+        return json({ ok: true, skipped: true });
+      }
+      const ticketId = m[1];
+      const result = await zendeskFetch(env, "PUT", `/api/v2/tickets/${ticketId}.json`, { ticket: { status: "solved" } });
+      await logEvent(env, { ep: "/webhooks/pipedrive/activity", activityId: current.id, ticketId, ok: !(result && result.error) });
+      return json({ ok: !(result && result.error), ticketId });
+    }
 
     // Debug
     if (path === "/__debug/log") {
