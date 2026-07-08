@@ -703,20 +703,21 @@ export default {
       const slice = allKeys.slice(offset, offset + count);
       let processed = 0, reassigned = 0, skipped = 0;
       const errors: any[] = [];
+      const skipReasons: any[] = [];
       for (const key of slice) {
         processed++;
         const ticketId = key.replace("ticket_activity:", "");
         const activityId = await env.OAUTH_KV.get(key);
-        if (!activityId) { skipped++; continue; }
+        if (!activityId) { skipped++; skipReasons.push({ ticketId, reason: "no_activity_id" }); continue; }
         try {
           const ticketRes = await zendeskFetch(env, "GET", `/api/v2/tickets/${ticketId}.json`);
           const assigneeId = ticketRes?.ticket?.assignee_id;
-          if (!assigneeId) { skipped++; continue; }
+          if (!assigneeId) { skipped++; skipReasons.push({ ticketId, reason: "no_assignee", ticketRes: ticketRes?.error ? ticketRes : undefined }); continue; }
           const userRes = await zendeskFetch(env, "GET", `/api/v2/users/${assigneeId}.json`);
           const assigneeEmail = userRes?.user?.email;
-          if (!assigneeEmail) { skipped++; continue; }
+          if (!assigneeEmail) { skipped++; skipReasons.push({ ticketId, reason: "no_assignee_email", userRes: userRes?.error ? userRes : undefined }); continue; }
           const pdUser = await findPipedriveUserByEmail(env, String(assigneeEmail));
-          if (!pdUser) { skipped++; continue; }
+          if (!pdUser) { skipped++; skipReasons.push({ ticketId, reason: "no_pd_user_match", assigneeEmail }); continue; }
           const updateRes = await pdFetch(env, "PUT", `/activities/${activityId}`, { user_id: pdUser.id });
           if (updateRes && updateRes.error) { errors.push({ ticketId, activityId, error: updateRes }); continue; }
           reassigned++;
@@ -724,7 +725,7 @@ export default {
           errors.push({ ticketId, activityId, error: e?.message || String(e) });
         }
       }
-      return json({ ok: true, totalKeys: allKeys.length, offset, count, processed, reassigned, skipped, errors: errors.slice(0, 10) });
+      return json({ ok: true, totalKeys: allKeys.length, offset, count, processed, reassigned, skipped, skipReasons: skipReasons.slice(0, 20), errors: errors.slice(0, 10) });
     }
 
     // One-time backfill: paginate Pipedrive activities and populate the ticket_activity:<id>
