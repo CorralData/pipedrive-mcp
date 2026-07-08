@@ -134,6 +134,26 @@ async function findPersonByExactEmail(env: Env, email: string): Promise<any | nu
   return null;
 }
 
+// Find the Pipedrive user (agent) whose email exactly matches the given address, so
+// synced activities can be assigned to whoever the Zendesk ticket is actually assigned to
+// instead of defaulting to the API token owner. Caches the user list in KV for 10 minutes
+// since /users is a small, slow-changing list and this runs on every webhook call.
+async function findPipedriveUserByEmail(env: Env, email: string): Promise<any | null> {
+  const target = email.trim().toLowerCase();
+  if (!target) return null;
+  let users: any[] | null = null;
+  const cached = await env.OAUTH_KV.get("pd_users_cache");
+  if (cached) {
+    try { users = JSON.parse(cached); } catch {}
+  }
+  if (!users) {
+    const res = await pdFetch(env, "GET", "/users");
+    users = Array.isArray(res?.data) ? res.data : [];
+    await env.OAUTH_KV.put("pd_users_cache", JSON.stringify(users), { expirationTtl: 600 });
+  }
+  return users.find((u: any) => String(u?.email || "").trim().toLowerCase() === target) || null;
+}
+
 // ============================================================================
 // MCP tools
 // ============================================================================
@@ -628,7 +648,7 @@ export default {
         { headers: { "Content-Type": "text/html" } }
       );
     }
-    if (path === "/webhooks/zendesk" && request.method === "POST") { const secret = url.searchParams.get("secret") || ""; if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) { return new Response("Unauthorized", { status: 401 }); } let payload: any = {}; try { payload = await request.json(); } catch { return json({ error: "invalid_json" }, 400); } const ticketId = payload.ticket_id; const subject = payload.subject || "Zendesk ticket"; const email = payload.requester_email; const ticketUrl = payload.ticket_url; const personMatch = email ? await findPersonByExactEmail(env, String(email)) : null; const activityBody: any = { subject: `Zendesk ticket #${ticketId}: ${subject}`, type: "task", note: `${ticketUrl || ""} - Requester: ${payload.requester_name || ""} <${email || ""}>` }; if (personMatch) { activityBody.person_id = personMatch.id; const orgId = (personMatch.organization && personMatch.organization.id) || personMatch.org_id; if (orgId) activityBody.org_id = orgId; } const result = await pdFetch(env, "POST", "/activities", activityBody); if (result && result.data && result.data.id) { await env.OAUTH_KV.put(`ticket_activity:${ticketId}`, String(result.data.id)); } await logEvent(env, { ep: "/webhooks/zendesk", ticketId, matched: !!personMatch, ok: !(result && result.error) }); return json({ ok: !(result && result.error), matched: !!personMatch }); }
+    if (path === "/webhooks/zendesk" && request.method === "POST") { const secret = url.searchParams.get("secret") || ""; if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) { return new Response("Unauthorized", { status: 401 }); } let payload: any = {}; try { payload = await request.json(); } catch { return json({ error: "invalid_json" }, 400); } const ticketId = payload.ticket_id; const subject = payload.subject || "Zendesk ticket"; const email = payload.requester_email; const ticketUrl = payload.ticket_url; const personMatch = email ? await findPersonByExactEmail(env, String(email)) : null; const assigneeEmail = payload.assignee_email; const assigneeUserMatch = assigneeEmail ? await findPipedriveUserByEmail(env, String(assigneeEmail)) : null; const activityBody: any = { subject: `Zendesk ticket #${ticketId}: ${subject}`, type: "task", note: `${ticketUrl || ""} - Requester: ${payload.requester_name || ""} <${email || ""}>` }; if (personMatch) { activityBody.person_id = personMatch.id; const orgId = (personMatch.organization && personMatch.organization.id) || personMatch.org_id; if (orgId) activityBody.org_id = orgId; } if (assigneeUserMatch) { activityBody.user_id = assigneeUserMatch.id; } const result = await pdFetch(env, "POST", "/activities", activityBody); if (result && result.data && result.data.id) { await env.OAUTH_KV.put(`ticket_activity:${ticketId}`, String(result.data.id)); } await logEvent(env, { ep: "/webhooks/zendesk", ticketId, matched: !!personMatch, ok: !(result && result.error) }); return json({ ok: !(result && result.error), matched: !!personMatch }); }
 
     // Forward sync: Zendesk ticket marked solved/closed -> mark the linked Pipedrive activity done.
     // Uses findActivityForTicket (KV mapping written at activity-creation time, with a
@@ -665,6 +685,46 @@ export default {
       if (!ticketId || !activityId) return json({ error: "missing ticket_id or activity_id" }, 400);
       await env.OAUTH_KV.put(`ticket_activity:${ticketId}`, activityId);
       return json({ ok: true, ticketId, activityId });
+    }
+
+    // One-time reassignment: for every known ticket_activity KV mapping, look up the Zendesk
+    // ticket's current assignee, match to a Pipedrive user by email, and set that user as the
+    // activity's owner. Chunked via ?offset=N&count=M (default 20) to stay under time limits;
+    // response includes totalKeys so callers know when they've covered everything. Safe to re-run.
+    if (path === "/__admin/reassign-ticket-activities" && request.method === "POST") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const offset = Number(url.searchParams.get("offset") || "0");
+      const count = Number(url.searchParams.get("count") || "20");
+      const listRes = await env.OAUTH_KV.list({ prefix: "ticket_activity:" });
+      const allKeys = listRes.keys.map((k) => k.name);
+      const slice = allKeys.slice(offset, offset + count);
+      let processed = 0, reassigned = 0, skipped = 0;
+      const errors: any[] = [];
+      for (const key of slice) {
+        processed++;
+        const ticketId = key.replace("ticket_activity:", "");
+        const activityId = await env.OAUTH_KV.get(key);
+        if (!activityId) { skipped++; continue; }
+        try {
+          const ticketRes = await zendeskFetch(env, "GET", `/api/v2/tickets/${ticketId}.json`);
+          const assigneeId = ticketRes?.ticket?.assignee_id;
+          if (!assigneeId) { skipped++; continue; }
+          const userRes = await zendeskFetch(env, "GET", `/api/v2/users/${assigneeId}.json`);
+          const assigneeEmail = userRes?.user?.email;
+          if (!assigneeEmail) { skipped++; continue; }
+          const pdUser = await findPipedriveUserByEmail(env, String(assigneeEmail));
+          if (!pdUser) { skipped++; continue; }
+          const updateRes = await pdFetch(env, "PUT", `/activities/${activityId}`, { user_id: pdUser.id });
+          if (updateRes && updateRes.error) { errors.push({ ticketId, activityId, error: updateRes }); continue; }
+          reassigned++;
+        } catch (e: any) {
+          errors.push({ ticketId, activityId, error: e?.message || String(e) });
+        }
+      }
+      return json({ ok: true, totalKeys: allKeys.length, offset, count, processed, reassigned, skipped, errors: errors.slice(0, 10) });
     }
 
     // One-time backfill: paginate Pipedrive activities and populate the ticket_activity:<id>
