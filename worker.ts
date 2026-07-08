@@ -804,6 +804,12 @@ export default {
       let payload: any = {};
       try { payload = await request.json(); } catch { return json({ error: "invalid_json" }, 400); }
       const ticketId = payload.ticket_id;
+      const excludedRaw = await env.OAUTH_KV.get("excluded_tickets");
+      const excludedSet = new Set<string>(excludedRaw ? JSON.parse(excludedRaw) : []);
+      if (excludedSet.has(String(ticketId))) {
+        await logEvent(env, { ep: "/webhooks/zendesk", ticketId, excluded: true, ok: true });
+        return json({ ok: true, excluded: true });
+      }
       const subject = payload.subject || "Zendesk ticket";
       const email = payload.requester_email;
       const ticketUrl = payload.ticket_url;
@@ -891,6 +897,53 @@ export default {
       return new Response("Method not allowed", { status: 405 });
     }
 
+    // Diagnostic: look up a Zendesk ticket's requester (id, name, email) directly. Used for
+    // manually investigating routing gaps (e.g. tickets with no requester_email surfaced via the
+    // backfill) without needing a separate Zendesk tool.
+    if (path === "/__admin/zendesk-ticket-requester" && request.method === "GET") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const ticketId = url.searchParams.get("ticket_id") || "";
+      if (!ticketId) return json({ error: "missing ticket_id" }, 400);
+      const ticketRes = await zendeskFetch(env, "GET", `/api/v2/tickets/${ticketId}.json`);
+      const requesterId = ticketRes?.ticket?.requester_id;
+      let requester: any = null;
+      if (requesterId) {
+        const userRes = await zendeskFetch(env, "GET", `/api/v2/users/${requesterId}.json`);
+        requester = userRes?.user
+          ? { id: userRes.user.id, name: userRes.user.name, email: userRes.user.email, role: userRes.user.role }
+          : { error: userRes };
+      }
+      return json({ ok: true, ticketId, organization_id: ticketRes?.ticket?.organization_id, assignee_id: ticketRes?.ticket?.assignee_id, requester });
+    }
+
+    // Excluded-ticket set (see EXCLUDED_TICKETS check in /webhooks/zendesk and backfill-org-routing):
+    // tickets that should never get a Pipedrive activity/org link at all (vendor spam, list-seller
+    // emails, etc. that land in the support inbox but aren't real customer requests). GET lists the
+    // set; POST with ?ticket_id=X adds one.
+    if (path === "/__admin/excluded-tickets") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      if (request.method === "GET") {
+        const raw = await env.OAUTH_KV.get("excluded_tickets");
+        return json({ ok: true, excluded: raw ? JSON.parse(raw) : [] });
+      }
+      if (request.method === "POST") {
+        const ticketId = url.searchParams.get("ticket_id") || "";
+        if (!ticketId) return json({ error: "missing ticket_id" }, 400);
+        const raw = await env.OAUTH_KV.get("excluded_tickets");
+        const list: string[] = raw ? JSON.parse(raw) : [];
+        if (!list.includes(ticketId)) list.push(ticketId);
+        await env.OAUTH_KV.put("excluded_tickets", JSON.stringify(list));
+        return json({ ok: true, excluded: list });
+      }
+      return new Response("Method not allowed", { status: 405 });
+    }
+
     // One-time reassignment: for every known ticket_activity KV mapping, look up the Zendesk
     // ticket's current assignee, match to a Pipedrive user by email, and set that user as the
     // activity's owner. Chunked via ?offset=N&count=M (default 20) to stay under time limits;
@@ -949,13 +1002,16 @@ export default {
       const listRes = await env.OAUTH_KV.list({ prefix: "ticket_activity:" });
       const allKeys = listRes.keys.map((k) => k.name);
       const slice = allKeys.slice(offset, offset + count);
-      let processed = 0, alreadyHadOrg = 0, fixed = 0, stillUnresolved = 0;
+      const excludedRaw = await env.OAUTH_KV.get("excluded_tickets");
+      const excludedSet = new Set<string>(excludedRaw ? JSON.parse(excludedRaw) : []);
+      let processed = 0, alreadyHadOrg = 0, fixed = 0, stillUnresolved = 0, excluded = 0;
       const fixedDetails: any[] = [];
       const unresolvedReasons: any[] = [];
       const errors: any[] = [];
       for (const key of slice) {
         processed++;
         const ticketId = key.replace("ticket_activity:", "");
+        if (excludedSet.has(ticketId)) { excluded++; continue; }
         const activityId = await env.OAUTH_KV.get(key);
         if (!activityId) { unresolvedReasons.push({ ticketId, reason: "no_activity_id" }); continue; }
         try {
@@ -983,7 +1039,7 @@ export default {
           errors.push({ ticketId, activityId, error: e?.message || String(e) });
         }
       }
-      return json({ ok: true, totalKeys: allKeys.length, offset, count, processed, alreadyHadOrg, fixed, stillUnresolved, fixedDetails, unresolvedReasons: unresolvedReasons.slice(0, 20), errors: errors.slice(0, 10) });
+      return json({ ok: true, totalKeys: allKeys.length, offset, count, processed, alreadyHadOrg, fixed, excluded, stillUnresolved, fixedDetails, unresolvedReasons: unresolvedReasons.slice(0, 20), errors: errors.slice(0, 10) });
     }
 
     // One-time backfill: paginate Pipedrive activities and populate the ticket_activity:<id>
