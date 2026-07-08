@@ -678,6 +678,19 @@ export default {
       return json({ ok: !(result && result.error), ticketId });
     }
 
+    // Temporary debug: inspect raw Pipedrive search responses while diagnosing the
+    // /webhooks/zendesk/solved activity-matching logic. Gated by the same webhook secret.
+    if (path === "/__debug/pdsearch") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const term = url.searchParams.get("term") || "";
+      const searchResultsRes = await pdFetch(env, "GET", `/searchResults?${new URLSearchParams({ term, item_types: "activity", limit: "10" })}`);
+      const itemSearchRes = await pdFetch(env, "GET", `/itemSearch?${new URLSearchParams({ term, item_types: "activity", limit: "10" })}`);
+      return json({ searchResultsRes, itemSearchRes });
+    }
+
     // Debug
     if (path === "/__debug/log") {
       const log = await env.OAUTH_KV.get("__debug_log");
