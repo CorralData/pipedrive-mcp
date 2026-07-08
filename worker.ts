@@ -87,6 +87,29 @@ async function zendeskFetch(env: Env, method: string, path: string, body?: any):
   return data;
 }
 
+// Find the Pipedrive activity linked to a Zendesk ticket. Fast path: a KV mapping written
+// when the activity was created (see /webhooks/zendesk). Fallback for activities created
+// before that mapping existed: paginate not-done activities and match the
+// "Zendesk ticket #<id>:" marker in the subject client-side. Note: Pipedrive's search APIs
+// (/searchResults is gone, /itemSearch explicitly rejects item_types=activity) can't do this
+// server-side, so this is the only reliable approach.
+async function findActivityForTicket(env: Env, ticketId: string): Promise<number | null> {
+  const mapped = await env.OAUTH_KV.get(`ticket_activity:${ticketId}`);
+  if (mapped) return Number(mapped);
+  const marker = `#${ticketId}:`;
+  for (let start = 0; start < 2500; start += 500) {
+    const res = await pdFetch(env, "GET", `/activities?${new URLSearchParams({ done: "0", limit: "500", start: String(start) })}`);
+    const items = Array.isArray(res?.data) ? res.data : [];
+    for (const act of items) {
+      if (typeof act?.subject === "string" && act.subject.includes(marker)) {
+        return act.id;
+      }
+    }
+    if (items.length < 500) break;
+  }
+  return null;
+}
+
 // Given a search term (email), find the Pipedrive person whose primary or listed
 // email address exactly (case-insensitively) matches. Returns null if no exact match,
 // rather than falling back to a fuzzy/first result (avoids mismatching to unrelated contacts).
@@ -605,12 +628,11 @@ export default {
         { headers: { "Content-Type": "text/html" } }
       );
     }
-    if (path === "/webhooks/zendesk" && request.method === "POST") { const secret = url.searchParams.get("secret") || ""; if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) { return new Response("Unauthorized", { status: 401 }); } let payload: any = {}; try { payload = await request.json(); } catch { return json({ error: "invalid_json" }, 400); } const ticketId = payload.ticket_id; const subject = payload.subject || "Zendesk ticket"; const email = payload.requester_email; const ticketUrl = payload.ticket_url; const personMatch = email ? await findPersonByExactEmail(env, String(email)) : null; const activityBody: any = { subject: `Zendesk ticket #${ticketId}: ${subject}`, type: "task", note: `${ticketUrl || ""} - Requester: ${payload.requester_name || ""} <${email || ""}>` }; if (personMatch) { activityBody.person_id = personMatch.id; const orgId = (personMatch.organization && personMatch.organization.id) || personMatch.org_id; if (orgId) activityBody.org_id = orgId; } const result = await pdFetch(env, "POST", "/activities", activityBody); await logEvent(env, { ep: "/webhooks/zendesk", ticketId, matched: !!personMatch, ok: !(result && result.error) }); return json({ ok: !(result && result.error), matched: !!personMatch }); }
+    if (path === "/webhooks/zendesk" && request.method === "POST") { const secret = url.searchParams.get("secret") || ""; if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) { return new Response("Unauthorized", { status: 401 }); } let payload: any = {}; try { payload = await request.json(); } catch { return json({ error: "invalid_json" }, 400); } const ticketId = payload.ticket_id; const subject = payload.subject || "Zendesk ticket"; const email = payload.requester_email; const ticketUrl = payload.ticket_url; const personMatch = email ? await findPersonByExactEmail(env, String(email)) : null; const activityBody: any = { subject: `Zendesk ticket #${ticketId}: ${subject}`, type: "task", note: `${ticketUrl || ""} - Requester: ${payload.requester_name || ""} <${email || ""}>` }; if (personMatch) { activityBody.person_id = personMatch.id; const orgId = (personMatch.organization && personMatch.organization.id) || personMatch.org_id; if (orgId) activityBody.org_id = orgId; } const result = await pdFetch(env, "POST", "/activities", activityBody); if (result && result.data && result.data.id) { await env.OAUTH_KV.put(`ticket_activity:${ticketId}`, String(result.data.id)); } await logEvent(env, { ep: "/webhooks/zendesk", ticketId, matched: !!personMatch, ok: !(result && result.error) }); return json({ ok: !(result && result.error), matched: !!personMatch }); }
 
     // Forward sync: Zendesk ticket marked solved/closed -> mark the linked Pipedrive activity done.
-    // We never stored an explicit ticket_id -> activity_id mapping, so we find the activity by
-    // searching Pipedrive for the "Zendesk ticket #<id>:" marker every created activity's subject
-    // carries (same marker the reverse sync below parses back out).
+    // Uses findActivityForTicket (KV mapping written at activity-creation time, with a
+    // paginated-scan fallback for activities that predate that mapping).
     if (path === "/webhooks/zendesk/solved" && request.method === "POST") {
       const secret = url.searchParams.get("secret") || "";
       if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
@@ -620,19 +642,13 @@ export default {
       try { payload = await request.json(); } catch { return json({ error: "invalid_json" }, 400); }
       const ticketId = payload.ticket_id;
       if (!ticketId) return json({ error: "missing_ticket_id" }, 400);
-      const marker = `Zendesk ticket #${ticketId}:`;
-      const searchRes = await pdFetch(env, "GET", `/searchResults?${new URLSearchParams({ term: marker, item_types: "activity", limit: "10" })}`);
-      const items = Array.isArray(searchRes?.data) ? searchRes.data : [];
-      let matchedActivityId: number | null = null;
-      for (const it of items) {
-        const label = String(it?.item?.subject || it?.item?.title || it?.item?.name || "");
-        if (label.includes(`#${ticketId}:`)) { matchedActivityId = it.item.id; break; }
-      }
+      const matchedActivityId = await findActivityForTicket(env, String(ticketId));
       if (!matchedActivityId) {
         await logEvent(env, { ep: "/webhooks/zendesk/solved", ticketId, matched: false, ok: true });
         return json({ ok: true, matched: false });
       }
       const result = await pdFetch(env, "PUT", `/activities/${matchedActivityId}`, { done: 1 });
+      await env.OAUTH_KV.put(`ticket_activity:${ticketId}`, String(matchedActivityId));
       await logEvent(env, { ep: "/webhooks/zendesk/solved", ticketId, matchedActivityId, ok: !(result && result.error) });
       return json({ ok: !(result && result.error), matched: true, matchedActivityId });
     }
@@ -676,19 +692,6 @@ export default {
       const result = await zendeskFetch(env, "PUT", `/api/v2/tickets/${ticketId}.json`, { ticket: { status: "solved" } });
       await logEvent(env, { ep: "/webhooks/pipedrive/activity", activityId: current.id, ticketId, ok: !(result && result.error) });
       return json({ ok: !(result && result.error), ticketId });
-    }
-
-    // Temporary debug: inspect raw Pipedrive search responses while diagnosing the
-    // /webhooks/zendesk/solved activity-matching logic. Gated by the same webhook secret.
-    if (path === "/__debug/pdsearch") {
-      const secret = url.searchParams.get("secret") || "";
-      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
-        return new Response("Unauthorized", { status: 401 });
-      }
-      const term = url.searchParams.get("term") || "";
-      const searchResultsRes = await pdFetch(env, "GET", `/searchResults?${new URLSearchParams({ term, item_types: "activity", limit: "10" })}`);
-      const itemSearchRes = await pdFetch(env, "GET", `/itemSearch?${new URLSearchParams({ term, item_types: "activity", limit: "10" })}`);
-      return json({ searchResultsRes, itemSearchRes });
     }
 
     // Debug
