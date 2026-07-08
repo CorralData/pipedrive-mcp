@@ -653,6 +653,31 @@ export default {
       return json({ ok: !(result && result.error), matched: true, matchedActivityId });
     }
 
+    // One-time backfill: paginate all Pipedrive activities and populate the ticket_activity:<id>
+    // KV mapping for every one whose subject carries the "Zendesk ticket #<id>:" marker. Needed
+    // because activities created before this mapping existed (e.g. the historical backfill) have
+    // no KV entry, and Pipedrive's search APIs can't reliably find them by text at scale. Safe to
+    // re-run any time (idempotent).
+    if (path === "/__admin/backfill-ticket-activity-kv" && request.method === "POST") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      let scanned = 0, mapped = 0, pages = 0;
+      for (let start = 0; start < 20000; start += 500) {
+        const res = await pdFetch(env, "GET", `/activities?${new URLSearchParams({ limit: "500", start: String(start) })}`);
+        const items = Array.isArray(res?.data) ? res.data : [];
+        scanned += items.length;
+        pages++;
+        for (const act of items) {
+          const m = typeof act?.subject === "string" ? act.subject.match(/Zendesk ticket #(\d+):/) : null;
+          if (m) { await env.OAUTH_KV.put(`ticket_activity:${m[1]}`, String(act.id)); mapped++; }
+        }
+        if (items.length < 500) break;
+      }
+      return json({ ok: true, scanned, mapped, pages });
+    }
+
     // One-time setup helper: registers the Pipedrive webhook subscription (activity updated)
     // pointing at /webhooks/pipedrive/activity. Safe to call more than once (Pipedrive just
     // creates another subscription); intended to be run once after deploy, not on a schedule.
