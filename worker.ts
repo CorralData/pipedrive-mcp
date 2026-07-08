@@ -653,6 +653,20 @@ export default {
       return json({ ok: !(result && result.error), matched: true, matchedActivityId });
     }
 
+    // Manually seed a single ticket_activity KV mapping. Used for spot-fixing/testing rather
+    // than waiting on the full historical scan below.
+    if (path === "/__admin/map-ticket-activity" && request.method === "POST") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const ticketId = url.searchParams.get("ticket_id") || "";
+      const activityId = url.searchParams.get("activity_id") || "";
+      if (!ticketId || !activityId) return json({ error: "missing ticket_id or activity_id" }, 400);
+      await env.OAUTH_KV.put(`ticket_activity:${ticketId}`, activityId);
+      return json({ ok: true, ticketId, activityId });
+    }
+
     // One-time backfill: paginate Pipedrive activities and populate the ticket_activity:<id>
     // KV mapping for every one whose subject carries the "Zendesk ticket #<id>:" marker. Needed
     // because activities created before this mapping existed (e.g. the historical backfill) have
