@@ -653,29 +653,33 @@ export default {
       return json({ ok: !(result && result.error), matched: true, matchedActivityId });
     }
 
-    // One-time backfill: paginate all Pipedrive activities and populate the ticket_activity:<id>
+    // One-time backfill: paginate Pipedrive activities and populate the ticket_activity:<id>
     // KV mapping for every one whose subject carries the "Zendesk ticket #<id>:" marker. Needed
     // because activities created before this mapping existed (e.g. the historical backfill) have
-    // no KV entry, and Pipedrive's search APIs can't reliably find them by text at scale. Safe to
-    // re-run any time (idempotent).
+    // no KV entry, and Pipedrive's search APIs can't reliably find them by text at scale.
+    // Chunked to stay well under request time limits: pass ?start=N to resume; response includes
+    // nextStart (call again with that value) or done:true when finished. Safe to re-run (idempotent).
     if (path === "/__admin/backfill-ticket-activity-kv" && request.method === "POST") {
       const secret = url.searchParams.get("secret") || "";
       if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
         return new Response("Unauthorized", { status: 401 });
       }
+      const startParam = Number(url.searchParams.get("start") || "0");
+      const pagesPerCall = 3; // ~1500 activities per invocation, comfortably under time limits
       let scanned = 0, mapped = 0, pages = 0;
-      for (let start = 0; start < 20000; start += 500) {
+      let start = startParam;
+      let reachedEnd = false;
+      for (; pages < pagesPerCall; pages++, start += 500) {
         const res = await pdFetch(env, "GET", `/activities?${new URLSearchParams({ limit: "500", start: String(start) })}`);
         const items = Array.isArray(res?.data) ? res.data : [];
         scanned += items.length;
-        pages++;
         for (const act of items) {
           const m = typeof act?.subject === "string" ? act.subject.match(/Zendesk ticket #(\d+):/) : null;
           if (m) { await env.OAUTH_KV.put(`ticket_activity:${m[1]}`, String(act.id)); mapped++; }
         }
-        if (items.length < 500) break;
+        if (items.length < 500) { reachedEnd = true; break; }
       }
-      return json({ ok: true, scanned, mapped, pages });
+      return json({ ok: true, scanned, mapped, startedAt: startParam, nextStart: reachedEnd ? null : start, done: reachedEnd });
     }
 
     // One-time setup helper: registers the Pipedrive webhook subscription (activity updated)
