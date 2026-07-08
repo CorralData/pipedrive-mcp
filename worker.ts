@@ -670,7 +670,7 @@ export default {
       let start = startParam;
       let reachedEnd = false;
       for (; pages < pagesPerCall; pages++, start += 500) {
-        const res = await pdFetch(env, "GET", `/activities?${new URLSearchParams({ limit: "500", start: String(start) })}`);
+        const res = await pdFetch(env, "GET", `/activities?${new URLSearchParams({ limit: "500", start: String(start), sort: "add_time DESC" })}`);
         const items = Array.isArray(res?.data) ? res.data : [];
         scanned += items.length;
         for (const act of items) {
