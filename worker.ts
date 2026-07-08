@@ -243,6 +243,40 @@ async function getDomainOverrides(env: Env): Promise<Record<string, number>> {
   try { return JSON.parse(raw); } catch { return {}; }
 }
 
+// Many of our own ticket subjects follow a "CompanyName // ..." or "CompanyName / ..." convention
+// (widget support requests, internally-authored tickets, and system-generated comment
+// notifications all do this). This is a last-resort fallback for cases where the requester's
+// email is missing, internal (e.g. a CorralData comment-relay address), or doesn't resolve to any
+// org - the company name is often sitting right in the subject even when the email is useless.
+function extractSubjectOrgHint(subject: string): string | null {
+  const cleaned = subject.replace(/^Zendesk ticket #\d+:\s*/, "");
+  const m = cleaned.match(/^([^/]{3,60}?)\s*\/\/?\s/);
+  return m ? m[1].trim() : null;
+}
+
+async function findOrgBySubjectHint(env: Env, hint: string): Promise<number | null> {
+  const res = await pdFetch(env, "GET", `/organizations/search?${new URLSearchParams({ term: hint, limit: "10" })}`);
+  const items = res?.data?.items || [];
+  const candidates = items.map((it: any) => ({ id: it.item.id, title: it.item.name }));
+  return fuzzyBestMatch(hint, candidates);
+}
+
+// Wraps findOrgForRequester with the subject-hint fallback: only tried when the email-based chain
+// came up empty, so it never overrides a confident email/domain match.
+async function findOrgForRequesterWithHint(env: Env, email: string | null, subject: string): Promise<{ orgId: number | null; personId: number | null; reason: string }> {
+  let routing = email
+    ? await findOrgForRequester(env, email)
+    : { orgId: null, personId: null, reason: "no_requester_email" };
+  if (!routing.orgId) {
+    const hint = extractSubjectOrgHint(subject);
+    if (hint) {
+      const hintOrgId = await findOrgBySubjectHint(env, hint);
+      if (hintOrgId) return { orgId: hintOrgId, personId: routing.personId, reason: "subject_name_fallback_match" };
+    }
+  }
+  return routing;
+}
+
 // Full org-matching chain for a new ticket's requester: exact-email Person match first (as
 // before), then a curated domain-override lookup (no Person required - see getDomainOverrides),
 // then a Person-based domain fallback for everything else, with an open-deal tiebreak (scoped to
@@ -813,7 +847,7 @@ export default {
       const subject = payload.subject || "Zendesk ticket";
       const email = payload.requester_email;
       const ticketUrl = payload.ticket_url;
-      const routing = email ? await findOrgForRequester(env, String(email)) : { orgId: null, personId: null, reason: "no_requester_email" };
+      const routing = await findOrgForRequesterWithHint(env, email ? String(email) : null, subject);
       let dealId: number | null = null;
       if (routing.orgId) dealId = await pickDealForOrg(env, routing.orgId, subject);
       const assigneeEmail = payload.assignee_email;
@@ -1021,11 +1055,12 @@ export default {
           if (activity.org_id) { alreadyHadOrg++; continue; }
           const ticketRes = await zendeskFetch(env, "GET", `/api/v2/tickets/${ticketId}.json`);
           const requesterId = ticketRes?.ticket?.requester_id;
-          if (!requesterId) { stillUnresolved++; unresolvedReasons.push({ ticketId, activityId, reason: "no_requester_id" }); continue; }
-          const userRes = await zendeskFetch(env, "GET", `/api/v2/users/${requesterId}.json`);
-          const requesterEmail = userRes?.user?.email;
-          if (!requesterEmail) { stillUnresolved++; unresolvedReasons.push({ ticketId, activityId, reason: "no_requester_email" }); continue; }
-          const routing = await findOrgForRequester(env, String(requesterEmail));
+          let requesterEmail: string | null = null;
+          if (requesterId) {
+            const userRes = await zendeskFetch(env, "GET", `/api/v2/users/${requesterId}.json`);
+            requesterEmail = userRes?.user?.email || null;
+          }
+          const routing = await findOrgForRequesterWithHint(env, requesterEmail, activity.subject || "");
           if (!routing.orgId) { stillUnresolved++; unresolvedReasons.push({ ticketId, activityId, reason: routing.reason }); continue; }
           const dealId = await pickDealForOrg(env, routing.orgId, activity.subject || "");
           const updateBody: any = { org_id: routing.orgId };
