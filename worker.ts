@@ -231,24 +231,21 @@ async function pickDealForOrg(env: Env, orgId: number, ticketSubject: string): P
   return fuzzyId && fuzzyId !== oldest.id ? fuzzyId : oldest.id;
 }
 
-// Extracts a bare domain (lowercased, no scheme/www/path) from a Pipedrive organization's
-// website field, for the org-first domain fast path below.
-function orgWebsiteDomain(org: any): string | null {
-  const w = org?.website;
-  if (!w || typeof w !== "string") return null;
-  try {
-    const withScheme = w.includes("://") ? w : `https://${w}`;
-    const host = new URL(withScheme).hostname.toLowerCase().replace(/^www\./, "");
-    return host || null;
-  } catch {
-    return w.toLowerCase().replace(/^www\./, "").split("/")[0] || null;
-  }
+// Domain -> org_id override map, stored in KV as a flat JSON object (see
+// /__admin/set-domain-override). Exists because Pipedrive's /organizations/search endpoint does
+// NOT index the organization "website" field (its `fields` param only supports address/custom_fields,
+// and search-result items don't even include website) - so there's no way to search Organizations
+// directly by domain via the API. This override map is the practical substitute: a small,
+// explicitly-curated domain->org table that's checked before falling back to Person-email search.
+async function getDomainOverrides(env: Env): Promise<Record<string, number>> {
+  const raw = await env.OAUTH_KV.get("domain_org_overrides");
+  if (!raw) return {};
+  try { return JSON.parse(raw); } catch { return {}; }
 }
 
 // Full org-matching chain for a new ticket's requester: exact-email Person match first (as
-// before), then an ORG-first domain check (searches Organizations directly by name and checks
-// their website field for a matching domain - no Person required), then a Person-based domain
-// fallback for orgs whose website field isn't populated, with an open-deal tiebreak (scoped to
+// before), then a curated domain-override lookup (no Person required - see getDomainOverrides),
+// then a Person-based domain fallback for everything else, with an open-deal tiebreak (scoped to
 // Account Growth/Onboarding) when a domain maps to more than one org (duplicate org records).
 // Returns null org/deal when nothing can be confidently resolved rather than guessing - callers
 // should flag those for review.
@@ -264,17 +261,9 @@ async function findOrgForRequester(env: Env, email: string): Promise<{ orgId: nu
   if (!domain || CONSUMER_EMAIL_DOMAINS.has(domain)) {
     return { orgId: null, personId, reason: "no_org_generic_or_missing_domain" };
   }
-  // Org-first: if any organization has this exact domain set as its website, use it directly -
-  // no Person record required. This is what lets a ticket route correctly even when the actual
-  // requester (e.g. a new employee) has never been entered as a Person in Pipedrive.
-  const orgSearchRes = await pdFetch(env, "GET", `/organizations/search?${new URLSearchParams({ term: domain, limit: "20" })}`);
-  const orgSearchItems = orgSearchRes?.data?.items || [];
-  const websiteMatchOrgIds = orgSearchItems
-    .map((it: any) => it.item)
-    .filter((o: any) => o && orgWebsiteDomain(o) === domain)
-    .map((o: any) => o.id);
-  if (websiteMatchOrgIds.length === 1) {
-    return { orgId: websiteMatchOrgIds[0], personId, reason: "org_website_domain_match" };
+  const overrides = await getDomainOverrides(env);
+  if (overrides[domain]) {
+    return { orgId: overrides[domain], personId, reason: "domain_override_match" };
   }
   const searchRes = await pdFetch(env, "GET", `/persons/search?${new URLSearchParams({ term: `@${domain}`, fields: "email", limit: "50" })}`);
   const items = searchRes?.data?.items || [];
@@ -877,6 +866,29 @@ export default {
       if (!ticketId || !activityId) return json({ error: "missing ticket_id or activity_id" }, 400);
       await env.OAUTH_KV.put(`ticket_activity:${ticketId}`, activityId);
       return json({ ok: true, ticketId, activityId });
+    }
+
+    // Domain -> org_id override table (see getDomainOverrides / findOrgForRequester). GET lists
+    // the current map; POST with ?domain=X&org_id=Y adds/updates one entry. This is the practical
+    // substitute for organization-domain search, which Pipedrive's API doesn't support.
+    if (path === "/__admin/domain-overrides") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      if (request.method === "GET") {
+        return json({ ok: true, overrides: await getDomainOverrides(env) });
+      }
+      if (request.method === "POST") {
+        const domain = (url.searchParams.get("domain") || "").trim().toLowerCase();
+        const orgId = Number(url.searchParams.get("org_id") || "");
+        if (!domain || !orgId) return json({ error: "missing domain or org_id" }, 400);
+        const overrides = await getDomainOverrides(env);
+        overrides[domain] = orgId;
+        await env.OAUTH_KV.put("domain_org_overrides", JSON.stringify(overrides));
+        return json({ ok: true, domain, orgId, overrides });
+      }
+      return new Response("Method not allowed", { status: 405 });
     }
 
     // One-time reassignment: for every known ticket_activity KV mapping, look up the Zendesk
