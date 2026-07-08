@@ -155,6 +155,120 @@ async function findPipedriveUserByEmail(env: Env, email: string): Promise<any | 
 }
 
 // ============================================================================
+// Org/deal routing for new Zendesk tickets
+// ============================================================================
+// Pipelines used for support-ticket routing (both, per decision: a deal can only live in one
+// pipeline at a time, and orgs with open deals in both are rare - when it happens, Onboarding
+// wins since it represents the more time-sensitive/active relationship).
+const ACCOUNT_GROWTH_PIPELINE_ID = 4;
+const ONBOARDING_PIPELINE_ID = 10;
+
+// Free/consumer email providers are excluded from domain-based org matching - many unrelated
+// people share these domains, so matching on them would misroute tickets to a random org.
+const CONSUMER_EMAIL_DOMAINS = new Set([
+  "gmail.com", "yahoo.com", "outlook.com", "hotmail.com", "icloud.com", "aol.com",
+  "protonmail.com", "live.com", "msn.com", "me.com", "comcast.net", "yahoo.co.uk",
+]);
+
+function normalizeCompanyText(s: string): string {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/\b(llc|inc|inc\.|corp|corporation|group|co|ltd|company|copy)\b/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function lcsLength(a: string, b: string): number {
+  const dp = new Array(b.length + 1).fill(0);
+  for (let i = 1; i <= a.length; i++) {
+    let prev = 0;
+    for (let j = 1; j <= b.length; j++) {
+      const temp = dp[j];
+      dp[j] = a[i - 1] === b[j - 1] ? prev + 1 : Math.max(dp[j], dp[j - 1]);
+      prev = temp;
+    }
+  }
+  return dp[b.length];
+}
+
+// Approximates difflib.SequenceMatcher ratio (2*matches/total length), same formula used in the
+// one-time historical deal-backfill, plus the same +0.9 substring-containment boost/threshold 0.75.
+function similarityRatio(a: string, b: string): number {
+  if (!a && !b) return 1;
+  if (!a || !b) return 0;
+  let ratio = (2 * lcsLength(a, b)) / (a.length + b.length);
+  if (a.includes(b) || b.includes(a)) ratio = Math.max(ratio, 0.9);
+  return ratio;
+}
+
+function fuzzyBestMatch(subject: string, candidates: { id: number; title: string }[]): number | null {
+  const normSubject = normalizeCompanyText(subject);
+  let best: { id: number; score: number } | null = null;
+  for (const c of candidates) {
+    const score = similarityRatio(normSubject, normalizeCompanyText(c.title));
+    if (!best || score > best.score) best = { id: c.id, score };
+  }
+  return best && best.score >= 0.75 ? best.id : null;
+}
+
+// Given a resolved org, pick which specific open deal (if any) a new ticket activity should
+// attach to, scoped to Account Growth + Onboarding only. Prefers Onboarding when the org has an
+// open deal in both; fuzzy-matches ticket text against deal titles when a pipeline has 2+ open deals.
+async function pickDealForOrg(env: Env, orgId: number, ticketSubject: string): Promise<number | null> {
+  const res = await pdFetch(env, "GET", `/organizations/${orgId}/deals?${new URLSearchParams({ status: "open", limit: "100" })}`);
+  const deals: any[] = Array.isArray(res?.data) ? res.data : [];
+  const onboarding = deals.filter((d) => d.pipeline_id === ONBOARDING_PIPELINE_ID);
+  const accountGrowth = deals.filter((d) => d.pipeline_id === ACCOUNT_GROWTH_PIPELINE_ID);
+  const pool = onboarding.length > 0 ? onboarding : accountGrowth;
+  if (pool.length === 0) return null;
+  if (pool.length === 1) return pool[0].id;
+  return fuzzyBestMatch(ticketSubject, pool.map((d) => ({ id: d.id, title: d.title })));
+}
+
+// Full org-matching chain for a new ticket's requester: exact-email Person match first (as
+// before), then a domain fallback that searches for any other Person at the same company domain
+// who does have an org set, with an open-deal tiebreak (scoped to Account Growth/Onboarding) when
+// that domain maps to more than one org (duplicate org records). Returns null org/deal when
+// nothing can be confidently resolved rather than guessing - callers should flag those for review.
+async function findOrgForRequester(env: Env, email: string): Promise<{ orgId: number | null; personId: number | null; reason: string }> {
+  const target = email.trim().toLowerCase();
+  const person = await findPersonByExactEmail(env, target);
+  const personId = person ? person.id : null;
+  if (person) {
+    const orgId = (person.organization && person.organization.id) || person.org_id || null;
+    if (orgId) return { orgId, personId, reason: "exact_person_match" };
+  }
+  const domain = target.split("@")[1];
+  if (!domain || CONSUMER_EMAIL_DOMAINS.has(domain)) {
+    return { orgId: null, personId, reason: "no_org_generic_or_missing_domain" };
+  }
+  const searchRes = await pdFetch(env, "GET", `/persons/search?${new URLSearchParams({ term: `@${domain}`, fields: "email", limit: "50" })}`);
+  const items = searchRes?.data?.items || [];
+  const orgIds = new Set<number>();
+  for (const it of items) {
+    const p = it.item;
+    const oid = (p && p.organization && p.organization.id) || (p && p.org_id);
+    if (oid) orgIds.add(oid);
+  }
+  if (orgIds.size === 0) return { orgId: null, personId, reason: "no_org_found_for_domain" };
+  if (orgIds.size === 1) return { orgId: [...orgIds][0], personId, reason: "domain_fallback_single_org" };
+  // Multiple distinct orgs share this domain (duplicate org records) - tiebreak on which one has
+  // an open deal in Account Growth or Onboarding. If more than one qualifies, stay ambiguous.
+  let candidateOrgId: number | null = null;
+  for (const oid of orgIds) {
+    const dealsRes = await pdFetch(env, "GET", `/organizations/${oid}/deals?${new URLSearchParams({ status: "open", limit: "50" })}`);
+    const deals: any[] = Array.isArray(dealsRes?.data) ? dealsRes.data : [];
+    const scoped = deals.filter((d) => d.pipeline_id === ACCOUNT_GROWTH_PIPELINE_ID || d.pipeline_id === ONBOARDING_PIPELINE_ID);
+    if (scoped.length > 0) {
+      if (candidateOrgId !== null) return { orgId: null, personId, reason: "ambiguous_multiple_orgs_with_deals" };
+      candidateOrgId = oid;
+    }
+  }
+  if (candidateOrgId !== null) return { orgId: candidateOrgId, personId, reason: "domain_fallback_tiebreak_open_deal" };
+  return { orgId: null, personId, reason: "ambiguous_multiple_orgs_no_deals" };
+}
+
+// ============================================================================
 // MCP tools
 // ============================================================================
 
@@ -654,7 +768,45 @@ export default {
         { headers: { "Content-Type": "text/html" } }
       );
     }
-    if (path === "/webhooks/zendesk" && request.method === "POST") { const secret = url.searchParams.get("secret") || ""; if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) { return new Response("Unauthorized", { status: 401 }); } let payload: any = {}; try { payload = await request.json(); } catch { return json({ error: "invalid_json" }, 400); } const ticketId = payload.ticket_id; const subject = payload.subject || "Zendesk ticket"; const email = payload.requester_email; const ticketUrl = payload.ticket_url; const personMatch = email ? await findPersonByExactEmail(env, String(email)) : null; const assigneeEmail = payload.assignee_email; const assigneeUserMatch = assigneeEmail ? await findPipedriveUserByEmail(env, String(assigneeEmail)) : null; const activityBody: any = { subject: `Zendesk ticket #${ticketId}: ${subject}`, type: "task", note: `${ticketUrl || ""} - Requester: ${payload.requester_name || ""} <${email || ""}>` }; if (personMatch) { activityBody.person_id = personMatch.id; const orgId = (personMatch.organization && personMatch.organization.id) || personMatch.org_id; if (orgId) activityBody.org_id = orgId; } if (assigneeUserMatch) { activityBody.user_id = assigneeUserMatch.id; } const result = await pdFetch(env, "POST", "/activities", activityBody); if (result && result.data && result.data.id) { await env.OAUTH_KV.put(`ticket_activity:${ticketId}`, String(result.data.id)); } await logEvent(env, { ep: "/webhooks/zendesk", ticketId, matched: !!personMatch, ok: !(result && result.error) }); return json({ ok: !(result && result.error), matched: !!personMatch }); }
+    // Forward sync: new Zendesk ticket -> new Pipedrive activity.
+    // Org routing: exact-email Person match first, then a domain fallback (findOrgForRequester)
+    // that also tiebreaks duplicate org records via open-deal presence in Account
+    // Growth/Onboarding. Deal routing: pickDealForOrg attaches a specific open deal when the
+    // matched org has exactly one (or a confident fuzzy-title match), preferring Onboarding.
+    if (path === "/webhooks/zendesk" && request.method === "POST") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      let payload: any = {};
+      try { payload = await request.json(); } catch { return json({ error: "invalid_json" }, 400); }
+      const ticketId = payload.ticket_id;
+      const subject = payload.subject || "Zendesk ticket";
+      const email = payload.requester_email;
+      const ticketUrl = payload.ticket_url;
+      const routing = email ? await findOrgForRequester(env, String(email)) : { orgId: null, personId: null, reason: "no_requester_email" };
+      let dealId: number | null = null;
+      if (routing.orgId) dealId = await pickDealForOrg(env, routing.orgId, subject);
+      const assigneeEmail = payload.assignee_email;
+      const assigneeUserMatch = assigneeEmail ? await findPipedriveUserByEmail(env, String(assigneeEmail)) : null;
+      const noteLines = [`${ticketUrl || ""} - Requester: ${payload.requester_name || ""} <${email || ""}>`];
+      if (!routing.orgId) noteLines.push(`[Needs manual org link - routing reason: ${routing.reason}]`);
+      const activityBody: any = {
+        subject: `Zendesk ticket #${ticketId}: ${subject}`,
+        type: "task",
+        note: noteLines.join("\n"),
+      };
+      if (routing.personId) activityBody.person_id = routing.personId;
+      if (routing.orgId) activityBody.org_id = routing.orgId;
+      if (dealId) activityBody.deal_id = dealId;
+      if (assigneeUserMatch) activityBody.user_id = assigneeUserMatch.id;
+      const result = await pdFetch(env, "POST", "/activities", activityBody);
+      if (result && result.data && result.data.id) {
+        await env.OAUTH_KV.put(`ticket_activity:${ticketId}`, String(result.data.id));
+      }
+      await logEvent(env, { ep: "/webhooks/zendesk", ticketId, orgId: routing.orgId, dealId, reason: routing.reason, ok: !(result && result.error) });
+      return json({ ok: !(result && result.error), matchedOrg: !!routing.orgId, matchedDeal: !!dealId, reason: routing.reason });
+    }
 
     // Forward sync: Zendesk ticket marked solved/closed -> mark the linked Pipedrive activity done.
     // Uses findActivityForTicket (KV mapping written at activity-creation time, with a
@@ -732,6 +884,60 @@ export default {
         }
       }
       return json({ ok: true, totalKeys: allKeys.length, offset, count, processed, reassigned, skipped, skipReasons: skipReasons.slice(0, 20), errors: errors.slice(0, 10) });
+    }
+
+    // Retroactive cleanup: for every known ticket_activity KV mapping whose Pipedrive activity
+    // currently has NO org_id, re-run the new findOrgForRequester/pickDealForOrg logic (domain
+    // fallback + duplicate-org tiebreak, now that duplicate orgs have been merged) against the
+    // Zendesk ticket's real requester email, and update the activity if it now resolves. Activities
+    // that already have an org_id are left untouched - this only fixes previously-unmatched ones,
+    // never overwrites an existing match. Chunked via ?offset=N&count=M (default 15, kept small
+    // since each item does several Pipedrive + Zendesk calls). Safe to re-run.
+    if (path === "/__admin/backfill-org-routing" && request.method === "POST") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const offset = Number(url.searchParams.get("offset") || "0");
+      const count = Number(url.searchParams.get("count") || "15");
+      const listRes = await env.OAUTH_KV.list({ prefix: "ticket_activity:" });
+      const allKeys = listRes.keys.map((k) => k.name);
+      const slice = allKeys.slice(offset, offset + count);
+      let processed = 0, alreadyHadOrg = 0, fixed = 0, stillUnresolved = 0;
+      const fixedDetails: any[] = [];
+      const unresolvedReasons: any[] = [];
+      const errors: any[] = [];
+      for (const key of slice) {
+        processed++;
+        const ticketId = key.replace("ticket_activity:", "");
+        const activityId = await env.OAUTH_KV.get(key);
+        if (!activityId) { unresolvedReasons.push({ ticketId, reason: "no_activity_id" }); continue; }
+        try {
+          const activityRes = await pdFetch(env, "GET", `/activities/${activityId}`);
+          const activity = activityRes?.data;
+          if (!activity) { errors.push({ ticketId, activityId, error: "activity_fetch_failed" }); continue; }
+          if (activity.org_id) { alreadyHadOrg++; continue; }
+          const ticketRes = await zendeskFetch(env, "GET", `/api/v2/tickets/${ticketId}.json`);
+          const requesterId = ticketRes?.ticket?.requester_id;
+          if (!requesterId) { stillUnresolved++; unresolvedReasons.push({ ticketId, activityId, reason: "no_requester_id" }); continue; }
+          const userRes = await zendeskFetch(env, "GET", `/api/v2/users/${requesterId}.json`);
+          const requesterEmail = userRes?.user?.email;
+          if (!requesterEmail) { stillUnresolved++; unresolvedReasons.push({ ticketId, activityId, reason: "no_requester_email" }); continue; }
+          const routing = await findOrgForRequester(env, String(requesterEmail));
+          if (!routing.orgId) { stillUnresolved++; unresolvedReasons.push({ ticketId, activityId, reason: routing.reason }); continue; }
+          const dealId = await pickDealForOrg(env, routing.orgId, activity.subject || "");
+          const updateBody: any = { org_id: routing.orgId };
+          if (routing.personId) updateBody.person_id = routing.personId;
+          if (dealId) updateBody.deal_id = dealId;
+          const updateRes = await pdFetch(env, "PUT", `/activities/${activityId}`, updateBody);
+          if (updateRes && updateRes.error) { errors.push({ ticketId, activityId, error: updateRes }); continue; }
+          fixed++;
+          fixedDetails.push({ ticketId, activityId, orgId: routing.orgId, dealId, reason: routing.reason });
+        } catch (e: any) {
+          errors.push({ ticketId, activityId, error: e?.message || String(e) });
+        }
+      }
+      return json({ ok: true, totalKeys: allKeys.length, offset, count, processed, alreadyHadOrg, fixed, stillUnresolved, fixedDetails, unresolvedReasons: unresolvedReasons.slice(0, 20), errors: errors.slice(0, 10) });
     }
 
     // One-time backfill: paginate Pipedrive activities and populate the ticket_activity:<id>
