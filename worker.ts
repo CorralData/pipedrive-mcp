@@ -665,7 +665,7 @@ export default {
         return new Response("Unauthorized", { status: 401 });
       }
       const startParam = Number(url.searchParams.get("start") || "0");
-      const pagesPerCall = 3; // ~1500 activities per invocation, comfortably under time limits
+      const pagesPerCall = 1; // 500 activities per invocation, comfortably under time limits
       let scanned = 0, mapped = 0, pages = 0;
       let start = startParam;
       let reachedEnd = false;
