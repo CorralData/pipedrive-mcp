@@ -213,7 +213,11 @@ function fuzzyBestMatch(subject: string, candidates: { id: number; title: string
 
 // Given a resolved org, pick which specific open deal (if any) a new ticket activity should
 // attach to, scoped to Account Growth + Onboarding only. Prefers Onboarding when the org has an
-// open deal in both; fuzzy-matches ticket text against deal titles when a pipeline has 2+ open deals.
+// open deal in both. When a pipeline has 2+ open deals, the standing rule (per Alex) is: default
+// to the OLDEST deal for that org (by add_time) - that's the usual pattern. Fuzzy title-matching is
+// kept only as a secondary signal: if it finds a strong (>=0.75) match to a *different* deal than the
+// oldest one, that more specific match wins (e.g. a ticket explicitly about a named add-on deal),
+// otherwise oldest wins.
 async function pickDealForOrg(env: Env, orgId: number, ticketSubject: string): Promise<number | null> {
   const res = await pdFetch(env, "GET", `/organizations/${orgId}/deals?${new URLSearchParams({ status: "open", limit: "100" })}`);
   const deals: any[] = Array.isArray(res?.data) ? res.data : [];
@@ -222,14 +226,32 @@ async function pickDealForOrg(env: Env, orgId: number, ticketSubject: string): P
   const pool = onboarding.length > 0 ? onboarding : accountGrowth;
   if (pool.length === 0) return null;
   if (pool.length === 1) return pool[0].id;
-  return fuzzyBestMatch(ticketSubject, pool.map((d) => ({ id: d.id, title: d.title })));
+  const oldest = [...pool].sort((a, b) => new Date(a.add_time).getTime() - new Date(b.add_time).getTime())[0];
+  const fuzzyId = fuzzyBestMatch(ticketSubject, pool.map((d) => ({ id: d.id, title: d.title })));
+  return fuzzyId && fuzzyId !== oldest.id ? fuzzyId : oldest.id;
+}
+
+// Extracts a bare domain (lowercased, no scheme/www/path) from a Pipedrive organization's
+// website field, for the org-first domain fast path below.
+function orgWebsiteDomain(org: any): string | null {
+  const w = org?.website;
+  if (!w || typeof w !== "string") return null;
+  try {
+    const withScheme = w.includes("://") ? w : `https://${w}`;
+    const host = new URL(withScheme).hostname.toLowerCase().replace(/^www\./, "");
+    return host || null;
+  } catch {
+    return w.toLowerCase().replace(/^www\./, "").split("/")[0] || null;
+  }
 }
 
 // Full org-matching chain for a new ticket's requester: exact-email Person match first (as
-// before), then a domain fallback that searches for any other Person at the same company domain
-// who does have an org set, with an open-deal tiebreak (scoped to Account Growth/Onboarding) when
-// that domain maps to more than one org (duplicate org records). Returns null org/deal when
-// nothing can be confidently resolved rather than guessing - callers should flag those for review.
+// before), then an ORG-first domain check (searches Organizations directly by name and checks
+// their website field for a matching domain - no Person required), then a Person-based domain
+// fallback for orgs whose website field isn't populated, with an open-deal tiebreak (scoped to
+// Account Growth/Onboarding) when a domain maps to more than one org (duplicate org records).
+// Returns null org/deal when nothing can be confidently resolved rather than guessing - callers
+// should flag those for review.
 async function findOrgForRequester(env: Env, email: string): Promise<{ orgId: number | null; personId: number | null; reason: string }> {
   const target = email.trim().toLowerCase();
   const person = await findPersonByExactEmail(env, target);
@@ -241,6 +263,18 @@ async function findOrgForRequester(env: Env, email: string): Promise<{ orgId: nu
   const domain = target.split("@")[1];
   if (!domain || CONSUMER_EMAIL_DOMAINS.has(domain)) {
     return { orgId: null, personId, reason: "no_org_generic_or_missing_domain" };
+  }
+  // Org-first: if any organization has this exact domain set as its website, use it directly -
+  // no Person record required. This is what lets a ticket route correctly even when the actual
+  // requester (e.g. a new employee) has never been entered as a Person in Pipedrive.
+  const orgSearchRes = await pdFetch(env, "GET", `/organizations/search?${new URLSearchParams({ term: domain, limit: "20" })}`);
+  const orgSearchItems = orgSearchRes?.data?.items || [];
+  const websiteMatchOrgIds = orgSearchItems
+    .map((it: any) => it.item)
+    .filter((o: any) => o && orgWebsiteDomain(o) === domain)
+    .map((o: any) => o.id);
+  if (websiteMatchOrgIds.length === 1) {
+    return { orgId: websiteMatchOrgIds[0], personId, reason: "org_website_domain_match" };
   }
   const searchRes = await pdFetch(env, "GET", `/persons/search?${new URLSearchParams({ term: `@${domain}`, fields: "email", limit: "50" })}`);
   const items = searchRes?.data?.items || [];
