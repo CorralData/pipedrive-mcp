@@ -26,8 +26,5 @@
       "deleted_classes": ["PipedriveMCPContainer"],
       "tag": "v2"
     }
-  ],
-  "triggers": {
-    "crons": ["0 12 * * *"]
-  }
+  ]
 }
