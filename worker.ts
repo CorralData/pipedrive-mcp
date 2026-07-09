@@ -19,6 +19,7 @@ interface Env {
   ZENDESK_WEBHOOK_SECRET: string;
   ZENDESK_API_TOKEN: string;
   PIPEDRIVE_ACTIVITY_WEBHOOK_SECRET: string;
+  RESEND_API_KEY: string;
 }
 
 const ZENDESK_SUBDOMAIN = "corraldata";
@@ -323,6 +324,95 @@ async function findOrgForRequester(env: Env, email: string): Promise<{ orgId: nu
   }
   if (candidateOrgId !== null) return { orgId: candidateOrgId, personId, reason: "domain_fallback_tiebreak_open_deal" };
   return { orgId: null, personId, reason: "ambiguous_multiple_orgs_no_deals" };
+}
+
+// ============================================================================
+// Routing-exception digest (Resend)
+// ============================================================================
+// Whenever live ticket routing can't confidently resolve an org (see findOrgForRequesterWithHint
+// in /webhooks/zendesk below) or the Pipedrive activity create call itself fails, the exception is
+// queued here in KV rather than emailed immediately - a daily cron (see `scheduled` export at the
+// bottom of this file) rolls everything queued since the last send into one digest email via
+// Resend, so Alex gets one email a day instead of one per ticket.
+async function queueDigestItem(env: Env, item: Record<string, any>) {
+  try {
+    const raw = await env.OAUTH_KV.get("digest_queue");
+    const items: any[] = raw ? JSON.parse(raw) : [];
+    items.push({ ts: new Date().toISOString(), ...item });
+    await env.OAUTH_KV.put("digest_queue", JSON.stringify(items));
+  } catch {}
+}
+
+async function sendResendEmail(env: Env, opts: { to: string; subject: string; html: string }): Promise<any> {
+  const res = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${env.RESEND_API_KEY}`,
+    },
+    body: JSON.stringify({
+      from: "CorralData Ops <ops@updates.corraldata.com>",
+      to: [opts.to],
+      subject: opts.subject,
+      html: opts.html,
+    }),
+  });
+  const text = await res.text();
+  let data: any;
+  try { data = JSON.parse(text); } catch { data = { _raw: text }; }
+  if (!res.ok) return { error: true, status: res.status, body: data };
+  return data;
+}
+
+function formatEtTimestamp(iso: string): string {
+  try {
+    return new Date(iso).toLocaleString("en-US", {
+      timeZone: "America/New_York",
+      dateStyle: "medium",
+      timeStyle: "short",
+    }) + " ET";
+  } catch { return iso; }
+}
+
+// Builds and sends the daily digest email if there are queued exceptions, then clears the queue on
+// success (left intact on failure so the next cron run/manual retry picks the same items back up).
+// Shared by both the `scheduled` cron handler and the manual /__admin/send-digest endpoint so
+// there's exactly one code path for "what does a digest send actually do."
+async function runDigest(env: Env): Promise<{ sent: boolean; count: number; error?: any }> {
+  const raw = await env.OAUTH_KV.get("digest_queue");
+  const items: any[] = raw ? JSON.parse(raw) : [];
+  if (items.length === 0) return { sent: false, count: 0 };
+  const rows = items.map((it) => `
+    <tr>
+      <td style="padding:8px 12px;border-bottom:1px solid #eee;white-space:nowrap;">${formatEtTimestamp(it.ts)}</td>
+      <td style="padding:8px 12px;border-bottom:1px solid #eee;white-space:nowrap;">${it.ticketUrl ? `<a href="${it.ticketUrl}">#${it.ticketId}</a>` : `#${it.ticketId}`}</td>
+      <td style="padding:8px 12px;border-bottom:1px solid #eee;">${String(it.subject || "").replace(/</g, "&lt;")}</td>
+      <td style="padding:8px 12px;border-bottom:1px solid #eee;">${it.reason || ""}</td>
+    </tr>`).join("");
+  const html = `
+    <div style="font-family:system-ui,sans-serif;max-width:680px;margin:auto;">
+      <h2 style="margin-bottom:4px;">Pipedrive routing exceptions</h2>
+      <p style="color:#555;margin-top:0;">${items.length} ticket${items.length === 1 ? "" : "s"} couldn't be auto-routed to a Pipedrive org since the last digest. Fix via a domain override (<code>/__admin/domain-overrides</code>) or org merge, then it'll route correctly going forward - no need to re-run anything manually.</p>
+      <table style="border-collapse:collapse;width:100%;font-size:14px;">
+        <thead>
+          <tr style="text-align:left;background:#f5f5f5;">
+            <th style="padding:8px 12px;">When</th>
+            <th style="padding:8px 12px;">Ticket</th>
+            <th style="padding:8px 12px;">Subject</th>
+            <th style="padding:8px 12px;">Reason</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+  const result = await sendResendEmail(env, {
+    to: "alex@corraldata.com",
+    subject: `Pipedrive routing exceptions: ${items.length} ticket${items.length === 1 ? "" : "s"} need review`,
+    html,
+  });
+  if (result && result.error) return { sent: false, count: items.length, error: result };
+  await env.OAUTH_KV.delete("digest_queue");
+  return { sent: true, count: items.length };
 }
 
 // ============================================================================
@@ -867,6 +957,14 @@ export default {
       if (result && result.data && result.data.id) {
         await env.OAUTH_KV.put(`ticket_activity:${ticketId}`, String(result.data.id));
       }
+      if (!routing.orgId || (result && result.error)) {
+        await queueDigestItem(env, {
+          ticketId,
+          subject,
+          ticketUrl,
+          reason: !routing.orgId ? routing.reason : "pipedrive_activity_create_failed",
+        });
+      }
       await logEvent(env, { ep: "/webhooks/zendesk", ticketId, orgId: routing.orgId, dealId, reason: routing.reason, ok: !(result && result.error) });
       return json({ ok: !(result && result.error), matchedOrg: !!routing.orgId, matchedDeal: !!dealId, reason: routing.reason });
     }
@@ -976,6 +1074,28 @@ export default {
         return json({ ok: true, excluded: list });
       }
       return new Response("Method not allowed", { status: 405 });
+    }
+
+    // Routing-exception digest (see runDigest above). GET peeks at what's currently queued without
+    // sending or clearing anything; POST forces an immediate send (same code path the daily cron
+    // uses) - handy for testing the Resend integration or re-sending after fixing RESEND_API_KEY
+    // without waiting for the next scheduled run. No-ops (sent:false) if the queue is empty.
+    if (path === "/__admin/digest-queue" && request.method === "GET") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const raw = await env.OAUTH_KV.get("digest_queue");
+      return json({ ok: true, items: raw ? JSON.parse(raw) : [] });
+    }
+    if (path === "/__admin/send-digest" && request.method === "POST") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const result = await runDigest(env);
+      await logEvent(env, { ep: "/__admin/send-digest", ...result });
+      return json({ ok: !result.error, ...result });
     }
 
     // One-time reassignment: for every known ticket_activity KV mapping, look up the Zendesk
@@ -1419,5 +1539,12 @@ export default {
     }
 
     return new Response("Not found", { status: 404 });
+  },
+
+  // Daily digest cron (see wrangler.jsonc triggers.crons and runDigest above). Rolls up every
+  // routing exception queued since the last successful send into one email via Resend.
+  async scheduled(_event: ScheduledEvent, env: Env, _ctx: ExecutionContext): Promise<void> {
+    const result = await runDigest(env);
+    await logEvent(env, { ep: "scheduled_digest", ...result });
   },
 } satisfies ExportedHandler<Env>;
