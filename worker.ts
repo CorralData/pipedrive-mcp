@@ -278,27 +278,60 @@ async function findOrgForRequesterWithHint(env: Env, email: string | null, subje
   return routing;
 }
 
+// Best-effort display name for a brand-new Person record when the Zendesk requester name is
+// missing/blank - title-cases the email's local part (e.g. "jane.doe" -> "Jane Doe").
+function bestEffortNameFromEmail(email: string): string {
+  const local = email.split("@")[0] || email;
+  const words = local.replace(/[._+-]+/g, " ").split(" ").filter(Boolean);
+  return words.length ? words.map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ") : email;
+}
+
+// Self-heals an existing Person record that's missing (or disagrees with) its org link, by
+// writing the resolved org_id back to Pipedrive. Only called with a confident single-org signal
+// (domain_org_overrides hit or an unambiguous domain_fallback_single_org match) - never for
+// ambiguous/tiebreak cases. Swallows failures (falls back to the un-healed reason) so a Pipedrive
+// write hiccup never blocks routing.
+async function healPersonOrgLink(env: Env, personId: number, orgId: number): Promise<boolean> {
+  const result = await pdFetch(env, "PUT", `/persons/${personId}`, { org_id: orgId });
+  return !(result && result.error);
+}
+
 // Full org-matching chain for a new ticket's requester: exact-email Person match first (as
 // before), then a curated domain-override lookup (no Person required - see getDomainOverrides),
 // then a Person-based domain fallback for everything else, with an open-deal tiebreak (scoped to
 // Account Growth/Onboarding) when a domain maps to more than one org (duplicate org records).
 // Returns null org/deal when nothing can be confidently resolved rather than guessing - callers
 // should flag those for review.
+// Self-healing: when the matched Person has no org_id (or one that disagrees with a confident
+// domain_org_overrides hit), this writes the resolved org_id back onto the Person via
+// healPersonOrgLink instead of just alerting Alex to link it by hand - reason
+// "auto_healed_person_org_link" in that case, still routes/logs as a normal success (no alert).
 async function findOrgForRequester(env: Env, email: string): Promise<{ orgId: number | null; personId: number | null; reason: string }> {
   const target = email.trim().toLowerCase();
   const person = await findPersonByExactEmail(env, target);
   const personId = person ? person.id : null;
-  if (person) {
-    const orgId = (person.organization && person.organization.id) || person.org_id || null;
-    if (orgId) return { orgId, personId, reason: "exact_person_match" };
-  }
+  const personOrgId = person ? ((person.organization && person.organization.id) || person.org_id || null) : null;
   const domain = target.split("@")[1];
   if (!domain || CONSUMER_EMAIL_DOMAINS.has(domain)) {
+    if (personOrgId) return { orgId: personOrgId, personId, reason: "exact_person_match" };
     return { orgId: null, personId, reason: "no_org_generic_or_missing_domain" };
   }
   const overrides = await getDomainOverrides(env);
-  if (overrides[domain]) {
-    return { orgId: overrides[domain], personId, reason: "domain_override_match" };
+  const overrideOrgId = overrides[domain] || null;
+  if (personOrgId) {
+    // Already linked. Cheap self-heal check: a curated override disagreeing with what's on the
+    // Person record means the link is stale/wrong - fix it. Otherwise trust the existing link.
+    if (overrideOrgId && overrideOrgId !== personOrgId && personId && (await healPersonOrgLink(env, personId, overrideOrgId))) {
+      return { orgId: overrideOrgId, personId, reason: "auto_healed_person_org_link" };
+    }
+    return { orgId: personOrgId, personId, reason: "exact_person_match" };
+  }
+  // Person exists but has no org_id at all, or there's no Person yet - try domain-based signals.
+  if (overrideOrgId) {
+    if (personId && (await healPersonOrgLink(env, personId, overrideOrgId))) {
+      return { orgId: overrideOrgId, personId, reason: "auto_healed_person_org_link" };
+    }
+    return { orgId: overrideOrgId, personId, reason: "domain_override_match" };
   }
   const searchRes = await pdFetch(env, "GET", `/persons/search?${new URLSearchParams({ term: `@${domain}`, fields: "email", limit: "50" })}`);
   const items = searchRes?.data?.items || [];
@@ -309,7 +342,13 @@ async function findOrgForRequester(env: Env, email: string): Promise<{ orgId: nu
     if (oid) orgIds.add(oid);
   }
   if (orgIds.size === 0) return { orgId: null, personId, reason: "no_org_found_for_domain" };
-  if (orgIds.size === 1) return { orgId: [...orgIds][0], personId, reason: "domain_fallback_single_org" };
+  if (orgIds.size === 1) {
+    const singleOrgId = [...orgIds][0];
+    if (personId && (await healPersonOrgLink(env, personId, singleOrgId))) {
+      return { orgId: singleOrgId, personId, reason: "auto_healed_person_org_link" };
+    }
+    return { orgId: singleOrgId, personId, reason: "domain_fallback_single_org" };
+  }
   // Multiple distinct orgs share this domain (duplicate org records) - tiebreak on which one has
   // an open deal in Account Growth or Onboarding. If more than one qualifies, stay ambiguous.
   let candidateOrgId: number | null = null;
@@ -324,6 +363,19 @@ async function findOrgForRequester(env: Env, email: string): Promise<{ orgId: nu
   }
   if (candidateOrgId !== null) return { orgId: candidateOrgId, personId, reason: "domain_fallback_tiebreak_open_deal" };
   return { orgId: null, personId, reason: "ambiguous_multiple_orgs_no_deals" };
+}
+
+// Creates a new Pipedrive Person for a domain-fallback/override match that has no existing
+// Person record for this exact email, linked directly to the resolved org_id. Mirrors the manual
+// step Alex was doing by hand for every new domain-matched contact (weramp.com, Sand Cloud,
+// Chamberlain, Aviva Aesthetics, etc.) - name prefers the Zendesk requester's display name, else
+// a best-effort guess from the email. Only called for confident single-org reasons (see caller in
+// /webhooks/zendesk); failures return null and the ticket still routes to the org, just without a
+// person_id (same as today's behavior).
+async function createPersonForDomainMatch(env: Env, email: string, requesterName: string | undefined | null, orgId: number): Promise<number | null> {
+  const name = (requesterName && requesterName.trim()) || bestEffortNameFromEmail(email);
+  const result = await pdFetch(env, "POST", "/persons", { name, email: [email], org_id: orgId });
+  return result && result.data && result.data.id ? result.data.id : null;
 }
 
 // ============================================================================
@@ -907,7 +959,28 @@ export default {
       const subject = payload.subject || "Zendesk ticket";
       const email = payload.requester_email;
       const ticketUrl = payload.ticket_url;
+      // Silent noise auto-exclusion (see /__admin/known-noise-senders): unlike excluded_tickets
+      // (one ticket ID at a time), this keys off the requester's email so every future ticket from
+      // a known automation/notification sender (Customer.io, Fathom, Fireflies, etc.) is skipped
+      // without needing Alex to add each new ticket ID by hand. Defaults to empty if unset.
+      const noiseRaw = await env.OAUTH_KV.get("known_noise_senders");
+      const noiseSet = new Set<string>(
+        noiseRaw ? (JSON.parse(noiseRaw) as string[]).map((e) => e.trim().toLowerCase()) : []
+      );
+      if (email && noiseSet.has(String(email).trim().toLowerCase())) {
+        await logEvent(env, { ep: "/webhooks/zendesk", ticketId, noiseSender: true, ok: true });
+        return json({ ok: true, noiseSender: true });
+      }
       const routing = await findOrgForRequesterWithHint(env, email ? String(email) : null, subject);
+      // Auto-create a Person for a domain-fallback/override match that has no existing Person yet
+      // (see createPersonForDomainMatch) - only for the confident, non-ambiguous reasons, so this
+      // never creates a Person off an uncertain/tiebreak match. Self-healing of an *existing*
+      // Person's org_id happens inside findOrgForRequester itself (reason auto_healed_person_org_link).
+      if (!routing.personId && routing.orgId && email &&
+          (routing.reason === "domain_override_match" || routing.reason === "domain_fallback_single_org")) {
+        const newPersonId = await createPersonForDomainMatch(env, String(email), payload.requester_name, routing.orgId);
+        if (newPersonId) routing.personId = newPersonId;
+      }
       let dealId: number | null = null;
       if (routing.orgId) dealId = await pickDealForOrg(env, routing.orgId, subject);
       const assigneeEmail = payload.assignee_email;
@@ -1043,6 +1116,32 @@ export default {
         if (!list.includes(ticketId)) list.push(ticketId);
         await env.OAUTH_KV.put("excluded_tickets", JSON.stringify(list));
         return json({ ok: true, excluded: list });
+      }
+      return new Response("Method not allowed", { status: 405 });
+    }
+
+    // Known-noise-sender set (see noiseSet check in /webhooks/zendesk): exact requester email
+    // addresses that should never route or alert, for ANY future ticket - not just one ticket ID
+    // (that's what excluded_tickets is for). Meant for automation/notification senders (Customer.io,
+    // Fathom, Fireflies, etc.) that show up in the support inbox repeatedly. GET lists the set;
+    // POST with ?email=X adds one (stored lowercase/trimmed).
+    if (path === "/__admin/known-noise-senders") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      if (request.method === "GET") {
+        const raw = await env.OAUTH_KV.get("known_noise_senders");
+        return json({ ok: true, noiseSenders: raw ? JSON.parse(raw) : [] });
+      }
+      if (request.method === "POST") {
+        const email = (url.searchParams.get("email") || "").trim().toLowerCase();
+        if (!email) return json({ error: "missing email" }, 400);
+        const raw = await env.OAUTH_KV.get("known_noise_senders");
+        const list: string[] = raw ? JSON.parse(raw) : [];
+        if (!list.includes(email)) list.push(email);
+        await env.OAUTH_KV.put("known_noise_senders", JSON.stringify(list));
+        return json({ ok: true, noiseSenders: list });
       }
       return new Response("Method not allowed", { status: 405 });
     }
