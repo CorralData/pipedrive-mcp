@@ -296,6 +296,56 @@ async function healPersonOrgLink(env: Env, personId: number, orgId: number): Pro
   return !(result && result.error);
 }
 
+// Normalizes a string to lowercase alphanumeric-only - stricter than normalizeCompanyText (which
+// keeps spaces and strips legal-entity suffixes), since here we're comparing an org name directly
+// against a domain-derived token that already has no separators at all.
+function normalizeToAlnum(s: string): string {
+  return String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+// Derives a human-readable search term and a fully-collapsed comparison token from an email
+// domain, e.g. "moon-juice-inc.com" -> term "moon juice inc", token "moonjuiceinc". Drops the TLD
+// (last dot-segment) and turns any remaining separators into spaces for the search term.
+function domainToNameGuess(domain: string): { term: string; token: string } {
+  const withoutTld = domain.split(".").slice(0, -1).join(" ");
+  const term = withoutTld.replace(/[^a-zA-Z0-9]+/g, " ").trim();
+  return { term, token: normalizeToAlnum(term) };
+}
+
+// Last-resort fallback inside findOrgForRequester for when there's no domain_org_overrides entry
+// and no Person (existing or domain-matched) points to any org at all: guesses that the domain
+// obviously names an existing Pipedrive org (e.g. "moonjuice.com" -> org "Moon Juice") and searches
+// Organizations for it (same /organizations/search endpoint as the search_organizations tool).
+// Only returns a match when confident - either the normalized org name equals the normalized
+// domain token, or exactly one candidate has a substring-containment match and no other candidate
+// is equally close. Ambiguous or weak results return null so the caller still falls through to the
+// real alert (see no_org_found_for_domain below).
+async function findOrgByFuzzyDomainName(env: Env, domain: string): Promise<number | null> {
+  const { term, token } = domainToNameGuess(domain);
+  if (token.length < 3) return null;
+  const res = await pdFetch(env, "GET", `/organizations/search?${new URLSearchParams({ term, limit: "10" })}`);
+  const items = res?.data?.items || [];
+  const candidates = items
+    .map((it: any) => ({ id: it.item.id, norm: normalizeToAlnum(it.item.name) }))
+    .filter((c: any) => c.norm);
+  const exact = candidates.filter((c: any) => c.norm === token);
+  if (exact.length === 1) return exact[0].id;
+  if (exact.length > 1) return null; // multiple orgs share the identical normalized name - ambiguous
+  const contained = candidates.filter((c: any) => c.norm.includes(token) || token.includes(c.norm));
+  return contained.length === 1 ? contained[0].id : null;
+}
+
+// Persists a new domain_org_overrides entry (read-modify-write, same pattern as
+// /__admin/domain-overrides) after a confident findOrgByFuzzyDomainName match, so future tickets
+// from this domain skip the fuzzy search entirely and hit the curated override instead.
+async function persistDomainOverride(env: Env, domain: string, orgId: number): Promise<void> {
+  const overrides = await getDomainOverrides(env);
+  if (overrides[domain] !== orgId) {
+    overrides[domain] = orgId;
+    await env.OAUTH_KV.put("domain_org_overrides", JSON.stringify(overrides));
+  }
+}
+
 // Full org-matching chain for a new ticket's requester: exact-email Person match first (as
 // before), then a curated domain-override lookup (no Person required - see getDomainOverrides),
 // then a Person-based domain fallback for everything else, with an open-deal tiebreak (scoped to
@@ -341,7 +391,16 @@ async function findOrgForRequester(env: Env, email: string): Promise<{ orgId: nu
     const oid = (p && p.organization && p.organization.id) || (p && p.org_id);
     if (oid) orgIds.add(oid);
   }
-  if (orgIds.size === 0) return { orgId: null, personId, reason: "no_org_found_for_domain" };
+  if (orgIds.size === 0) {
+    // No Person at all resolves this domain to an org - try a fuzzy org-name-to-domain guess
+    // (see findOrgByFuzzyDomainName) before giving up and alerting Alex.
+    const fuzzyOrgId = await findOrgByFuzzyDomainName(env, domain);
+    if (fuzzyOrgId) {
+      await persistDomainOverride(env, domain, fuzzyOrgId);
+      return { orgId: fuzzyOrgId, personId, reason: "fuzzy_org_name_domain_match" };
+    }
+    return { orgId: null, personId, reason: "no_org_found_for_domain" };
+  }
   if (orgIds.size === 1) {
     const singleOrgId = [...orgIds][0];
     if (personId && (await healPersonOrgLink(env, personId, singleOrgId))) {
@@ -977,7 +1036,8 @@ export default {
       // never creates a Person off an uncertain/tiebreak match. Self-healing of an *existing*
       // Person's org_id happens inside findOrgForRequester itself (reason auto_healed_person_org_link).
       if (!routing.personId && routing.orgId && email &&
-          (routing.reason === "domain_override_match" || routing.reason === "domain_fallback_single_org")) {
+          (routing.reason === "domain_override_match" || routing.reason === "domain_fallback_single_org" ||
+           routing.reason === "fuzzy_org_name_domain_match")) {
         const newPersonId = await createPersonForDomainMatch(env, String(email), payload.requester_name, routing.orgId);
         if (newPersonId) routing.personId = newPersonId;
       }
