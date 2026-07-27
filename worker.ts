@@ -25,6 +25,11 @@ interface Env {
 const ZENDESK_SUBDOMAIN = "corraldata";
 const ZENDESK_AGENT_EMAIL = "alex@corraldata.com";
 
+// Our own domain - never a customer. Used only to detect the "requester is actually a
+// CorralData employee cc'd into the thread" case (see findOrgViaInternalCcFallback), not as a
+// customer-domain signal.
+const CORRALDATA_INTERNAL_DOMAIN = "corraldata.com";
+
 function json(data: any, status = 200, extraHeaders: Record<string, string> = {}) {
   return new Response(JSON.stringify(data), {
     status,
@@ -276,6 +281,64 @@ async function findOrgForRequesterWithHint(env: Env, email: string | null, subje
     }
   }
   return routing;
+}
+
+// Gathers plausible external (non-corraldata.com) email addresses associated with a ticket, for
+// the internal-requester CC fallback (see findOrgViaInternalCcFallback below). Primary source:
+// the ticket's Zendesk collaborators/CC'd users/followers, resolved to real email addresses via
+// the Zendesk API (same zendeskFetch helper used everywhere else in this file, and the same
+// ticket-then-users lookup pattern as /__admin/zendesk-ticket-requester). Secondary source
+// (always also scanned - the API call can fail, or a real customer's address can be quoted in
+// the ticket text without them ever having been added as a Zendesk collaborator): a regex sweep
+// of the ticket subject for email-looking substrings. Collaborator-sourced addresses are ordered
+// first since they're the stronger signal. Swallows API failures rather than throwing, so a
+// Zendesk hiccup still leaves the subject-regex source available.
+async function collectExternalCandidateEmails(env: Env, ticketId: any, subject: string): Promise<string[]> {
+  const seen = new Set<string>();
+  const emails: string[] = [];
+  const add = (raw: string) => {
+    const e = raw.trim().toLowerCase();
+    const domain = e.split("@")[1];
+    if (!domain || domain === CORRALDATA_INTERNAL_DOMAIN || seen.has(e)) return;
+    seen.add(e);
+    emails.push(e);
+  };
+  try {
+    const ticketRes = await zendeskFetch(env, "GET", `/api/v2/tickets/${ticketId}.json`);
+    const ticket = ticketRes?.ticket;
+    const userIds = new Set<number>([
+      ...(Array.isArray(ticket?.collaborator_ids) ? ticket.collaborator_ids : []),
+      ...(Array.isArray(ticket?.email_cc_ids) ? ticket.email_cc_ids : []),
+      ...(Array.isArray(ticket?.follower_ids) ? ticket.follower_ids : []),
+    ]);
+    if (userIds.size > 0) {
+      const usersRes = await zendeskFetch(env, "GET", `/api/v2/users/show_many.json?ids=${[...userIds].join(",")}`);
+      const users = Array.isArray(usersRes?.users) ? usersRes.users : [];
+      for (const u of users) if (u && u.email) add(String(u.email));
+    }
+  } catch {}
+  const subjectMatches = String(subject || "").match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
+  for (const m of subjectMatches) add(m);
+  return emails;
+}
+
+// Requester domain gives zero routing signal when the ticket's requester is actually a
+// CorralData employee cc'd into a customer email thread (Zendesk then creates the ticket under
+// their identity rather than the real customer's - see ticket #13676, Pryor Health/Jay Cominos).
+// Gathers candidate external email addresses via collectExternalCandidateEmails and runs each
+// through the exact same routing chain used for a normal requester email (findOrgForRequester -
+// exact person match, domain_org_overrides, domain fallback/tiebreak, then the fuzzy org-name
+// match from findOrgByFuzzyDomainName), taking the first confident resolution. Only engaged by
+// the caller when the requester's own domain is corraldata.com, so this never runs (and never
+// changes behavior) for a normal external-customer requester. Returns null - caller falls through
+// unchanged to the normal no_org_found_for_domain alert - if nothing resolves.
+async function findOrgViaInternalCcFallback(env: Env, ticketId: any, subject: string): Promise<{ orgId: number; personId: number | null; reason: string; ccEmail: string } | null> {
+  const candidates = await collectExternalCandidateEmails(env, ticketId, subject);
+  for (const candidateEmail of candidates) {
+    const result = await findOrgForRequester(env, candidateEmail);
+    if (result.orgId) return { orgId: result.orgId, personId: result.personId, reason: result.reason, ccEmail: candidateEmail };
+  }
+  return null;
 }
 
 // Best-effort display name for a brand-new Person record when the Zendesk requester name is
@@ -1031,21 +1094,45 @@ export default {
         return json({ ok: true, noiseSender: true });
       }
       const routing = await findOrgForRequesterWithHint(env, email ? String(email) : null, subject);
+      // Requester-is-actually-internal fallback: when the chain above found nothing AND the
+      // requester's own domain is corraldata.com (a CorralData employee got cc'd into the
+      // customer's email thread and Zendesk created the ticket under their identity instead of
+      // the real customer's - see ticket #13676, Pryor Health/Jay Cominos), pull candidate
+      // external participant emails off the ticket and retry the same routing chain on those
+      // instead (see findOrgViaInternalCcFallback). Only engages in this exact case, so a normal
+      // external-customer requester is never affected.
+      let ccFallback: { ccEmail: string; underlyingReason: string } | null = null;
+      if (!routing.orgId && email && String(email).trim().toLowerCase().split("@")[1] === CORRALDATA_INTERNAL_DOMAIN) {
+        const ccResult = await findOrgViaInternalCcFallback(env, ticketId, subject);
+        if (ccResult) {
+          ccFallback = { ccEmail: ccResult.ccEmail, underlyingReason: ccResult.reason };
+          routing.orgId = ccResult.orgId;
+          routing.personId = ccResult.personId;
+          routing.reason = "resolved_via_cc_domain_fallback";
+        }
+      }
       // Auto-create a Person for a domain-fallback/override match that has no existing Person yet
       // (see createPersonForDomainMatch) - only for the confident, non-ambiguous reasons, so this
       // never creates a Person off an uncertain/tiebreak match. Self-healing of an *existing*
       // Person's org_id happens inside findOrgForRequester itself (reason auto_healed_person_org_link).
-      if (!routing.personId && routing.orgId && email &&
-          (routing.reason === "domain_override_match" || routing.reason === "domain_fallback_single_org" ||
-           routing.reason === "fuzzy_org_name_domain_match")) {
-        const newPersonId = await createPersonForDomainMatch(env, String(email), payload.requester_name, routing.orgId);
-        if (newPersonId) routing.personId = newPersonId;
+      // For a CC-fallback match, gate on the underlying reason from findOrgForRequester (carried in
+      // ccFallback.underlyingReason) since routing.reason was overwritten above to the wrapper code.
+      const personCreateReason = ccFallback ? ccFallback.underlyingReason : routing.reason;
+      if (!routing.personId && routing.orgId &&
+          (personCreateReason === "domain_override_match" || personCreateReason === "domain_fallback_single_org" ||
+           personCreateReason === "fuzzy_org_name_domain_match")) {
+        const personEmail = ccFallback ? ccFallback.ccEmail : email ? String(email) : null;
+        if (personEmail) {
+          const newPersonId = await createPersonForDomainMatch(env, personEmail, ccFallback ? null : payload.requester_name, routing.orgId);
+          if (newPersonId) routing.personId = newPersonId;
+        }
       }
       let dealId: number | null = null;
       if (routing.orgId) dealId = await pickDealForOrg(env, routing.orgId, subject);
       const assigneeEmail = payload.assignee_email;
       const assigneeUserMatch = assigneeEmail ? await findPipedriveUserByEmail(env, String(assigneeEmail)) : null;
       const noteLines = [`${ticketUrl || ""} - Requester: ${payload.requester_name || ""} <${email || ""}>`];
+      if (ccFallback) noteLines.push(`[Requester is internal (${email}) - routed using participant email ${ccFallback.ccEmail} instead, underlying match: ${ccFallback.underlyingReason}]`);
       if (!routing.orgId) noteLines.push(`[Needs manual org link - routing reason: ${routing.reason}]`);
       const activityBody: any = {
         subject: `Zendesk ticket #${ticketId}: ${subject}`,
@@ -1069,7 +1156,11 @@ export default {
         });
         await logEvent(env, { ep: "exception_alert", ticketId, ok: !(alertResult && alertResult.error), alertResult: alertResult?.error ? alertResult : undefined });
       }
-      await logEvent(env, { ep: "/webhooks/zendesk", ticketId, orgId: routing.orgId, dealId, reason: routing.reason, ok: !(result && result.error) });
+      await logEvent(env, {
+        ep: "/webhooks/zendesk", ticketId, orgId: routing.orgId, dealId, reason: routing.reason,
+        ccFallbackEmail: ccFallback?.ccEmail, ccFallbackUnderlyingReason: ccFallback?.underlyingReason,
+        ok: !(result && result.error),
+      });
       return json({ ok: !(result && result.error), matchedOrg: !!routing.orgId, matchedDeal: !!dealId, reason: routing.reason });
     }
 
