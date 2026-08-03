@@ -351,7 +351,8 @@ function bestEffortNameFromEmail(email: string): string {
 
 // Self-heals an existing Person record that's missing (or disagrees with) its org link, by
 // writing the resolved org_id back to Pipedrive. Only called with a confident single-org signal
-// (domain_org_overrides hit or an unambiguous domain_fallback_single_org match) - never for
+// (domain_org_overrides hit, an unambiguous domain_fallback_single_org match, or a confident
+// findOrgByFuzzyDomainName match - see the orgIds.size === 0 branch below) - never for
 // ambiguous/tiebreak cases. Swallows failures (falls back to the un-healed reason) so a Pipedrive
 // write hiccup never blocks routing.
 async function healPersonOrgLink(env: Env, personId: number, orgId: number): Promise<boolean> {
@@ -419,6 +420,11 @@ async function persistDomainOverride(env: Env, domain: string, orgId: number): P
 // domain_org_overrides hit), this writes the resolved org_id back onto the Person via
 // healPersonOrgLink instead of just alerting Alex to link it by hand - reason
 // "auto_healed_person_org_link" in that case, still routes/logs as a normal success (no alert).
+// Same idea applies when the only confident signal is a fuzzy org-name-to-domain match (see the
+// orgIds.size === 0 branch below) - reason "auto_healed_person_via_fuzzy_org_match" in that case
+// (fixes ticket #13736, jefflin@flamingoestate.com: an existing unlinked Person plus a real
+// "Flamingo estate" org, but no other Person on that domain and no override to trigger the
+// original auto-heal check).
 async function findOrgForRequester(env: Env, email: string): Promise<{ orgId: number | null; personId: number | null; reason: string }> {
   const target = email.trim().toLowerCase();
   const person = await findPersonByExactEmail(env, target);
@@ -455,11 +461,20 @@ async function findOrgForRequester(env: Env, email: string): Promise<{ orgId: nu
     if (oid) orgIds.add(oid);
   }
   if (orgIds.size === 0) {
-    // No Person at all resolves this domain to an org - try a fuzzy org-name-to-domain guess
+    // No other Person on this domain resolves it to an org - try a fuzzy org-name-to-domain guess
     // (see findOrgByFuzzyDomainName) before giving up and alerting Alex.
     const fuzzyOrgId = await findOrgByFuzzyDomainName(env, domain);
     if (fuzzyOrgId) {
       await persistDomainOverride(env, domain, fuzzyOrgId);
+      // If this requester already has a Person record that's just missing (or disagrees with)
+      // its org link, heal it now too - same as the override/domain-fallback signals above -
+      // instead of leaving it unlinked in Pipedrive even though the ticket itself routes fine.
+      // Fixes ticket #13736 (jefflin@flamingoestate.com): existing Person 4519 with org_id null,
+      // real org "Flamingo estate" 6671, but no other Person on the domain and no override to
+      // trigger the original auto-heal check.
+      if (personId && (await healPersonOrgLink(env, personId, fuzzyOrgId))) {
+        return { orgId: fuzzyOrgId, personId, reason: "auto_healed_person_via_fuzzy_org_match" };
+      }
       return { orgId: fuzzyOrgId, personId, reason: "fuzzy_org_name_domain_match" };
     }
     return { orgId: null, personId, reason: "no_org_found_for_domain" };
