@@ -30,6 +30,19 @@ const ZENDESK_AGENT_EMAIL = "alex@corraldata.com";
 // customer-domain signal.
 const CORRALDATA_INTERNAL_DOMAIN = "corraldata.com";
 
+// True for CorralData's own domain (or, in principle, any other domain we later decide is
+// "obviously internal, never a customer"). Single choke point for every self-heal code path that
+// resolves/persists a domain->org mapping (findOrgForRequester's override lookup, its
+// findOrgByFuzzyDomainName branch, and healPersonOrgLink) - so a requester's own internal domain
+// can never be cached as if it were a customer domain, regardless of which heal path reaches it.
+// Added after domain_org_overrides picked up a bad "corraldata.com": 4385 entry (org "Corraldata",
+// our own internal Pipedrive record) via a fuzzy org-name match on our own domain. Does NOT gate
+// findOrgViaInternalCcFallback or its candidate emails - those are external CC/collaborator
+// addresses by construction (see collectExternalCandidateEmails), not the requester's own domain.
+function isInternalDomain(domain: string): boolean {
+  return domain === CORRALDATA_INTERNAL_DOMAIN;
+}
+
 function json(data: any, status = 200, extraHeaders: Record<string, string> = {}) {
   return new Response(JSON.stringify(data), {
     status,
@@ -431,7 +444,11 @@ async function findOrgForRequester(env: Env, email: string): Promise<{ orgId: nu
   const personId = person ? person.id : null;
   const personOrgId = person ? ((person.organization && person.organization.id) || person.org_id || null) : null;
   const domain = target.split("@")[1];
-  if (!domain || CONSUMER_EMAIL_DOMAINS.has(domain)) {
+  // Never resolve/cache our own domain as a customer signal (see isInternalDomain) - treat it the
+  // same as a missing domain or a consumer provider: an existing Person's own org link (if any) is
+  // still honored below, but no override lookup, fuzzy org-name match, or persistDomainOverride
+  // write can ever happen for corraldata.com.
+  if (!domain || CONSUMER_EMAIL_DOMAINS.has(domain) || isInternalDomain(domain)) {
     if (personOrgId) return { orgId: personOrgId, personId, reason: "exact_person_match" };
     return { orgId: null, personId, reason: "no_org_generic_or_missing_domain" };
   }
