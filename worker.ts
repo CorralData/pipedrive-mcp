@@ -354,6 +354,43 @@ async function findOrgViaInternalCcFallback(env: Env, ticketId: any, subject: st
   return null;
 }
 
+// True when orgName shows up as its own word/phrase inside subject - not just a raw substring, so
+// a short/common org name can't silently match part of an unrelated word. Case-insensitive.
+function subjectContainsOrgName(subject: string, orgName: string): boolean {
+  const name = orgName.trim();
+  if (name.length < 3) return false;
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+");
+  const re = new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, "i");
+  return re.test(subject);
+}
+
+// Ticket #13767 gap: alina@corraldata.com (a TAM) sent a status-recap email to a customer, cc'ing
+// support@ - Zendesk created the ticket under her identity. findOrgViaInternalCcFallback came up
+// empty because there were no candidate emails at all (no Zendesk collaborators, and no
+// email-looking text in the subject for collectExternalCandidateEmails' regex sweep to find) - but
+// the real customer's name, "Annie Aesthetic", was sitting right in the subject
+// ("CorralData x Annie Aesthetic // ..."). This is a separate, deliberately LOWER-confidence
+// signal than a domain-based match (per Alex: text-matching against org names carries more
+// false-positive risk - a customer's name could be a common word, or two different customers could
+// have similar-sounding names) - so unlike findOrgByFuzzyDomainName/findOrgBySubjectHint, this never
+// auto-links. It only returns a hint for the caller to attach to the exception alert (reason
+// "subject_org_name_hint", distinct from findOrgForRequesterWithHint's "subject_name_fallback_match"
+// auto-linking reason above) so Alex can confirm and link it by hand. Only called when the CC
+// fallback above has already failed to resolve anything. Confidence gate: search Pipedrive orgs
+// using the (lightly-cleaned) subject text itself as the query, then only trust the result if
+// exactly one returned candidate's name appears as a distinct substring/phrase in the subject (see
+// subjectContainsOrgName) - zero or multiple such candidates means ambiguous, so no hint at all.
+async function findOrgNameHintInSubject(env: Env, subject: string): Promise<{ orgId: number; orgName: string } | null> {
+  const cleaned = subject.replace(/^Zendesk ticket #\d+:\s*/, "").trim();
+  if (cleaned.length < 3) return null;
+  const res = await pdFetch(env, "GET", `/organizations/search?${new URLSearchParams({ term: cleaned, limit: "10" })}`);
+  const items = res?.data?.items || [];
+  const matches = items
+    .map((it: any) => ({ id: it.item.id, name: String(it.item.name || "") }))
+    .filter((c: any) => c.name && subjectContainsOrgName(cleaned, c.name));
+  return matches.length === 1 ? { orgId: matches[0].id, orgName: matches[0].name } : null;
+}
+
 // Best-effort display name for a brand-new Person record when the Zendesk requester name is
 // missing/blank - title-cases the email's local part (e.g. "jane.doe" -> "Jane Doe").
 function bestEffortNameFromEmail(email: string): string {
@@ -571,8 +608,13 @@ function formatEtTimestamp(iso: string): string {
 
 // Sends one immediate email for a single routing exception. Failures are swallowed (logged via
 // logEvent by the caller) rather than thrown - a Resend outage should never block ticket sync.
-async function sendExceptionAlert(env: Env, item: { ticketId: any; subject?: string; ticketUrl?: string; reason: string }): Promise<any> {
+async function sendExceptionAlert(env: Env, item: { ticketId: any; subject?: string; ticketUrl?: string; reason: string; subjectOrgHint?: { orgId: number; orgName: string } | null }): Promise<any> {
   const ts = formatEtTimestamp(new Date().toISOString());
+  // Low-confidence subject-org-name hint (see findOrgNameHintInSubject) - annotation only, never
+  // auto-linked, so it's rendered as an extra row rather than folded into Reason/routing.
+  const hintRow = item.subjectOrgHint
+    ? `<tr><td style="padding:6px 12px;color:#777;">Subject hint</td><td style="padding:6px 12px;">Possible match based on subject: ${String(item.subjectOrgHint.orgName).replace(/</g, "&lt;")} (id ${item.subjectOrgHint.orgId}) - not auto-linked, please confirm.</td></tr>`
+    : "";
   const html = `
     <div style="font-family:system-ui,sans-serif;max-width:600px;margin:auto;">
       <h2 style="margin-bottom:4px;">Pipedrive routing exception</h2>
@@ -582,6 +624,7 @@ async function sendExceptionAlert(env: Env, item: { ticketId: any; subject?: str
         <tr><td style="padding:6px 12px;color:#777;">Ticket</td><td style="padding:6px 12px;">${item.ticketUrl ? `<a href="${item.ticketUrl}">#${item.ticketId}</a>` : `#${item.ticketId}`}</td></tr>
         <tr><td style="padding:6px 12px;color:#777;">Subject</td><td style="padding:6px 12px;">${String(item.subject || "").replace(/</g, "&lt;")}</td></tr>
         <tr><td style="padding:6px 12px;color:#777;">Reason</td><td style="padding:6px 12px;">${item.reason}</td></tr>
+        ${hintRow}
       </table>
     </div>`;
   return sendResendEmail(env, {
@@ -1134,6 +1177,13 @@ export default {
       // instead (see findOrgViaInternalCcFallback). Only engages in this exact case, so a normal
       // external-customer requester is never affected.
       let ccFallback: { ccEmail: string; underlyingReason: string } | null = null;
+      // Last-resort, review-only signal (ticket #13767): when the CC fallback above still finds
+      // nothing - e.g. no Zendesk collaborators AND no email-looking text in the subject for
+      // collectExternalCandidateEmails to find - try matching the subject text itself against
+      // Pipedrive org names (see findOrgNameHintInSubject). Deliberately never auto-links (routing
+      // stays whatever it already was, e.g. no_org_found_for_domain) - just carried through to
+      // sendExceptionAlert below so Alex can confirm it manually.
+      let subjectOrgHint: { orgId: number; orgName: string } | null = null;
       if (!routing.orgId && email && String(email).trim().toLowerCase().split("@")[1] === CORRALDATA_INTERNAL_DOMAIN) {
         const ccResult = await findOrgViaInternalCcFallback(env, ticketId, subject);
         if (ccResult) {
@@ -1141,6 +1191,8 @@ export default {
           routing.orgId = ccResult.orgId;
           routing.personId = ccResult.personId;
           routing.reason = "resolved_via_cc_domain_fallback";
+        } else {
+          subjectOrgHint = await findOrgNameHintInSubject(env, subject);
         }
       }
       // Auto-create a Person for a domain-fallback/override match that has no existing Person yet
@@ -1185,12 +1237,15 @@ export default {
           subject,
           ticketUrl,
           reason: !routing.orgId ? routing.reason : "pipedrive_activity_create_failed",
+          subjectOrgHint: !routing.orgId ? subjectOrgHint : null,
         });
         await logEvent(env, { ep: "exception_alert", ticketId, ok: !(alertResult && alertResult.error), alertResult: alertResult?.error ? alertResult : undefined });
       }
       await logEvent(env, {
         ep: "/webhooks/zendesk", ticketId, orgId: routing.orgId, dealId, reason: routing.reason,
         ccFallbackEmail: ccFallback?.ccEmail, ccFallbackUnderlyingReason: ccFallback?.underlyingReason,
+        subjectOrgHintReason: subjectOrgHint ? "subject_org_name_hint" : undefined,
+        subjectOrgHintOrgId: subjectOrgHint?.orgId, subjectOrgHintOrgName: subjectOrgHint?.orgName,
         ok: !(result && result.error),
       });
       return json({ ok: !(result && result.error), matchedOrg: !!routing.orgId, matchedDeal: !!dealId, reason: routing.reason });
