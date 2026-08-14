@@ -1214,14 +1214,6 @@ export default {
         await logEvent(env, { ep: "/webhooks/zendesk", ticketId, noiseSender: true, ok: true });
         return json({ ok: true, noiseSender: true });
       }
-      // Idempotency: Zendesk redelivers when a request times out, which previously
-      // created a second Pipedrive activity (and a second alert email) for the same
-      // ticket. If we already mapped an activity for this ticket, stop here.
-      const existingActivityId = await env.OAUTH_KV.get(`ticket_activity:${ticketId}`);
-      if (existingActivityId) {
-        await logEvent(env, { ep: "/webhooks/zendesk", ticketId, duplicateDelivery: true, activityId: existingActivityId, ok: true });
-        return json({ ok: true, duplicateDelivery: true, activityId: existingActivityId });
-      }
       const routing = await findOrgForRequesterWithHint(env, email ? String(email) : null, subject);
       // Requester-is-actually-internal fallback: when the chain above found nothing AND the
       // requester's own domain is corraldata.com (a CorralData employee got cc'd into the
