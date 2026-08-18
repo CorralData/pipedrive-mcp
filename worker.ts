@@ -1214,6 +1214,20 @@ export default {
         await logEvent(env, { ep: "/webhooks/zendesk", ticketId, noiseSender: true, ok: true });
         return json({ ok: true, noiseSender: true });
       }
+      // Redelivery guard. Zendesk retries when a request times out - that's how
+      // #13787, #13798 and #13806 each produced two Pipedrive activities and two
+      // alert emails 60-90s apart. The marker is written at the END of a successful
+      // run, not here, so a retry that is meant to recover a request which died
+      // mid-flight still gets through. Deliberately fail-open: a rare duplicate is
+      // better than a ticket silently getting no activity at all.
+      // Short window rather than a permanent block on ticket_activity:{id}, so this
+      // stays correct whether the Zendesk trigger fires on creation only or on
+      // updates too. Best-effort, not a lock - KV is eventually consistent.
+      const deliveryKey = `zd_delivery:${ticketId}`;
+      if (await env.OAUTH_KV.get(deliveryKey)) {
+        await logEvent(env, { ep: "/webhooks/zendesk", ticketId, redelivery: true, ok: true });
+        return json({ ok: true, redelivery: true });
+      }
       const routing = await findOrgForRequesterWithHint(env, email ? String(email) : null, subject);
       // Requester-is-actually-internal fallback: when the chain above found nothing AND the
       // requester's own domain is corraldata.com (a CorralData employee got cc'd into the
@@ -1277,6 +1291,8 @@ export default {
       if (result && result.data && result.data.id) {
         await env.OAUTH_KV.put(`ticket_activity:${ticketId}`, String(result.data.id));
       }
+      // Ticket handled - suppress Zendesk's retry for the next few minutes.
+      await env.OAUTH_KV.put(deliveryKey, new Date().toISOString(), { expirationTtl: 300 });
       if (!routing.orgId || (result && result.error)) {
         const alertReason = !routing.orgId ? routing.reason : "pipedrive_activity_create_failed";
         const alertedKey = `alerted_ticket:${ticketId}`;
