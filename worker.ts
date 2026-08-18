@@ -634,6 +634,52 @@ async function sendExceptionAlert(env: Env, item: { ticketId: any; subject?: str
   });
 }
 
+// Cold-outreach markers. Deliberately does NOT match a bare "unsubscribe":
+// our own Google Groups footer appends "To unsubscribe from this group..."
+// to inbound support@ mail, so a bare match would suppress everything.
+// These target sender-side opt-out boilerplate, which customer mail lacks.
+const SOLICITATION_MARKERS: RegExp[] = [
+  /opt[-\s]?out from receiving/i,
+  /respond to this email with\s*["'“”]?\s*unsubscribe/i,
+  /reply with the subject line\s*["'“”]?\s*opt[-\s]?out/i,
+  /if you'?re not interested,? kindly reply/i,
+  /not a pay-to-play/i,
+  /verified,?\s*(and\s*)?updated contact list/i,
+  /free sample list/i,
+];
+
+// Only called on the exception path, so the extra Zendesk read is rare.
+// zendeskFetch returns { error: true, ... } rather than throwing - on any
+// failure we fall through to alerting, which is the safe direction.
+async function looksLikeSolicitation(
+  env: Env,
+  ticketId: any,
+  subject: string
+): Promise<{ spam: boolean; marker?: string }> {
+  const res = await zendeskFetch(env, "GET", `/api/v2/tickets/${ticketId}.json`);
+  if (!res || res.error) return { spam: false };
+  const text = `${subject || ""}\n${res?.ticket?.description || ""}`;
+  for (const re of SOLICITATION_MARKERS) {
+    if (re.test(text)) return { spam: true, marker: String(re) };
+  }
+  return { spam: false };
+}
+
+// Audit trail. __debug_log is capped at 50 entries with a 24h TTL, so it
+// can't answer "what did we suppress last week" - keep a separate list.
+async function recordSuppressedSolicitation(env: Env, entry: Record<string, any>) {
+  try {
+    const raw = await env.OAUTH_KV.get("suppressed_solicitations");
+    const list = raw ? JSON.parse(raw) : [];
+    list.unshift({ ts: new Date().toISOString(), ...entry });
+    await env.OAUTH_KV.put(
+      "suppressed_solicitations",
+      JSON.stringify(list.slice(0, 200)),
+      { expirationTtl: 60 * 60 * 24 * 90 }
+    );
+  } catch {}
+}
+
 // ============================================================================
 // MCP tools
 // ============================================================================
@@ -1232,14 +1278,45 @@ export default {
         await env.OAUTH_KV.put(`ticket_activity:${ticketId}`, String(result.data.id));
       }
       if (!routing.orgId || (result && result.error)) {
-        const alertResult = await sendExceptionAlert(env, {
-          ticketId,
-          subject,
-          ticketUrl,
-          reason: !routing.orgId ? routing.reason : "pipedrive_activity_create_failed",
-          subjectOrgHint: !routing.orgId ? subjectOrgHint : null,
-        });
-        await logEvent(env, { ep: "exception_alert", ticketId, ok: !(alertResult && alertResult.error), alertResult: alertResult?.error ? alertResult : undefined });
+        const alertReason = !routing.orgId ? routing.reason : "pipedrive_activity_create_failed";
+        const alertedKey = `alerted_ticket:${ticketId}`;
+        if (await env.OAUTH_KV.get(alertedKey)) {
+          // Zendesk redelivers when a request times out, which produced two
+          // identical alerts 60-90s apart for #13787, #13798 and #13806.
+          await logEvent(env, { ep: "exception_alert", ticketId, duplicateSuppressed: true, ok: true });
+        } else {
+          // Only suppress when Pipedrive has no idea who this is: no org, no
+          // Person, no CC or subject fallback. Anything we half-recognise alerts.
+          const noPipedriveSignal = !routing.orgId && !routing.personId && !subjectOrgHint && !ccFallback;
+          const solicitation = noPipedriveSignal
+            ? await looksLikeSolicitation(env, ticketId, subject)
+            : { spam: false, marker: undefined as string | undefined };
+          if (solicitation.spam) {
+            await env.OAUTH_KV.put(alertedKey, "solicitation", { expirationTtl: 604800 });
+            await recordSuppressedSolicitation(env, {
+              ticketId,
+              subject,
+              requester: email ? String(email).trim().toLowerCase() : null,
+              marker: solicitation.marker,
+            });
+            await logEvent(env, { ep: "exception_alert", ticketId, solicitationSuppressed: true, ok: true });
+          } else {
+            const alertResult = await sendExceptionAlert(env, {
+              ticketId,
+              subject,
+              ticketUrl,
+              reason: alertReason,
+              subjectOrgHint: !routing.orgId ? subjectOrgHint : null,
+            });
+            await env.OAUTH_KV.put(alertedKey, "sent", { expirationTtl: 604800 });
+            await logEvent(env, {
+              ep: "exception_alert",
+              ticketId,
+              ok: !(alertResult && alertResult.error),
+              alertResult: alertResult?.error ? alertResult : undefined,
+            });
+          }
+        }
       }
       await logEvent(env, {
         ep: "/webhooks/zendesk", ticketId, orgId: routing.orgId, dealId, reason: routing.reason,
@@ -1382,6 +1459,17 @@ export default {
         return json({ ok: true, noiseSenders: list });
       }
       return new Response("Method not allowed", { status: 405 });
+    }
+
+    // Solicitations suppressed by the cold-outreach rule (see looksLikeSolicitation).
+    // Read this weekly - if a real customer shows up here, the markers are too broad.
+    if (path === "/__admin/suppressed-solicitations" && request.method === "GET") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
+      const raw = await env.OAUTH_KV.get("suppressed_solicitations");
+      return json({ ok: true, suppressed: raw ? JSON.parse(raw) : [] });
     }
 
     // Manual test of the routing-exception alert path (see sendExceptionAlert above) - fires one
@@ -1570,14 +1658,26 @@ export default {
 
     // Debug
     if (path === "/__debug/log") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
       const log = await env.OAUTH_KV.get("__debug_log");
       return json(log ? JSON.parse(log) : []);
     }
     if (path === "/__debug/clear") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
       await env.OAUTH_KV.delete("__debug_log");
       return json({ cleared: true });
     }
     if (path === "/__debug") {
+      const secret = url.searchParams.get("secret") || "";
+      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+        return new Response("Unauthorized", { status: 401 });
+      }
       return json({
         OIDC_CLIENT_ID_set: !!env.OIDC_CLIENT_ID,
         OIDC_CLIENT_SECRET_set: !!env.OIDC_CLIENT_SECRET,
