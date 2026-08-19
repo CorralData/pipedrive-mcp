@@ -17,6 +17,7 @@ interface Env {
   OIDC_ISSUER: string;
   OAUTH_KV: KVNamespace;
   ZENDESK_WEBHOOK_SECRET: string;
+  ADMIN_SECRET: string;
   ZENDESK_API_TOKEN: string;
   PIPEDRIVE_ACTIVITY_WEBHOOK_SECRET: string;
   RESEND_API_KEY: string;
@@ -1371,7 +1372,8 @@ export default {
     // than waiting on the full historical scan below.
     if (path === "/__admin/map-ticket-activity" && request.method === "POST") {
       const secret = url.searchParams.get("secret") || "";
-      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+      const validAdminSecret = (env.ZENDESK_WEBHOOK_SECRET && secret === env.ZENDESK_WEBHOOK_SECRET) || (env.ADMIN_SECRET && secret === env.ADMIN_SECRET);
+      if (!validAdminSecret) {
         return new Response("Unauthorized", { status: 401 });
       }
       const ticketId = url.searchParams.get("ticket_id") || "";
@@ -1386,7 +1388,8 @@ export default {
     // substitute for organization-domain search, which Pipedrive's API doesn't support.
     if (path === "/__admin/domain-overrides") {
       const secret = url.searchParams.get("secret") || "";
-      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+      const validAdminSecret = (env.ZENDESK_WEBHOOK_SECRET && secret === env.ZENDESK_WEBHOOK_SECRET) || (env.ADMIN_SECRET && secret === env.ADMIN_SECRET);
+      if (!validAdminSecret) {
         return new Response("Unauthorized", { status: 401 });
       }
       if (request.method === "GET") {
@@ -1409,7 +1412,8 @@ export default {
     // backfill) without needing a separate Zendesk tool.
     if (path === "/__admin/zendesk-ticket-requester" && request.method === "GET") {
       const secret = url.searchParams.get("secret") || "";
-      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+      const validAdminSecret = (env.ZENDESK_WEBHOOK_SECRET && secret === env.ZENDESK_WEBHOOK_SECRET) || (env.ADMIN_SECRET && secret === env.ADMIN_SECRET);
+      if (!validAdminSecret) {
         return new Response("Unauthorized", { status: 401 });
       }
       const ticketId = url.searchParams.get("ticket_id") || "";
@@ -1432,7 +1436,8 @@ export default {
     // set; POST with ?ticket_id=X adds one.
     if (path === "/__admin/excluded-tickets") {
       const secret = url.searchParams.get("secret") || "";
-      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+      const validAdminSecret = (env.ZENDESK_WEBHOOK_SECRET && secret === env.ZENDESK_WEBHOOK_SECRET) || (env.ADMIN_SECRET && secret === env.ADMIN_SECRET);
+      if (!validAdminSecret) {
         return new Response("Unauthorized", { status: 401 });
       }
       if (request.method === "GET") {
@@ -1458,7 +1463,8 @@ export default {
     // POST with ?email=X adds one (stored lowercase/trimmed).
     if (path === "/__admin/known-noise-senders") {
       const secret = url.searchParams.get("secret") || "";
-      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+      const validAdminSecret = (env.ZENDESK_WEBHOOK_SECRET && secret === env.ZENDESK_WEBHOOK_SECRET) || (env.ADMIN_SECRET && secret === env.ADMIN_SECRET);
+      if (!validAdminSecret) {
         return new Response("Unauthorized", { status: 401 });
       }
       if (request.method === "GET") {
@@ -1481,7 +1487,8 @@ export default {
     // Read this weekly - if a real customer shows up here, the markers are too broad.
     if (path === "/__admin/suppressed-solicitations" && request.method === "GET") {
       const secret = url.searchParams.get("secret") || "";
-      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+      const validAdminSecret = (env.ZENDESK_WEBHOOK_SECRET && secret === env.ZENDESK_WEBHOOK_SECRET) || (env.ADMIN_SECRET && secret === env.ADMIN_SECRET);
+      if (!validAdminSecret) {
         return new Response("Unauthorized", { status: 401 });
       }
       const raw = await env.OAUTH_KV.get("suppressed_solicitations");
@@ -1492,7 +1499,8 @@ export default {
     // real email via Resend without needing a live Zendesk ticket to fail routing first.
     if (path === "/__admin/test-exception-alert" && request.method === "POST") {
       const secret = url.searchParams.get("secret") || "";
-      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+      const validAdminSecret = (env.ZENDESK_WEBHOOK_SECRET && secret === env.ZENDESK_WEBHOOK_SECRET) || (env.ADMIN_SECRET && secret === env.ADMIN_SECRET);
+      if (!validAdminSecret) {
         return new Response("Unauthorized", { status: 401 });
       }
       const result = await sendExceptionAlert(env, {
@@ -1509,7 +1517,8 @@ export default {
     // response includes totalKeys so callers know when they've covered everything. Safe to re-run.
     if (path === "/__admin/reassign-ticket-activities" && request.method === "POST") {
       const secret = url.searchParams.get("secret") || "";
-      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+      const validAdminSecret = (env.ZENDESK_WEBHOOK_SECRET && secret === env.ZENDESK_WEBHOOK_SECRET) || (env.ADMIN_SECRET && secret === env.ADMIN_SECRET);
+      if (!validAdminSecret) {
         return new Response("Unauthorized", { status: 401 });
       }
       const offset = Number(url.searchParams.get("offset") || "0");
@@ -1553,7 +1562,8 @@ export default {
     // since each item does several Pipedrive + Zendesk calls). Safe to re-run.
     if (path === "/__admin/backfill-org-routing" && request.method === "POST") {
       const secret = url.searchParams.get("secret") || "";
-      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+      const validAdminSecret = (env.ZENDESK_WEBHOOK_SECRET && secret === env.ZENDESK_WEBHOOK_SECRET) || (env.ADMIN_SECRET && secret === env.ADMIN_SECRET);
+      if (!validAdminSecret) {
         return new Response("Unauthorized", { status: 401 });
       }
       const offset = Number(url.searchParams.get("offset") || "0");
@@ -1610,7 +1620,8 @@ export default {
     // nextStart (call again with that value) or done:true when finished. Safe to re-run (idempotent).
     if (path === "/__admin/backfill-ticket-activity-kv" && request.method === "POST") {
       const secret = url.searchParams.get("secret") || "";
-      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+      const validAdminSecret = (env.ZENDESK_WEBHOOK_SECRET && secret === env.ZENDESK_WEBHOOK_SECRET) || (env.ADMIN_SECRET && secret === env.ADMIN_SECRET);
+      if (!validAdminSecret) {
         return new Response("Unauthorized", { status: 401 });
       }
       const startParam = Number(url.searchParams.get("start") || "0");
@@ -1675,7 +1686,8 @@ export default {
     // Debug
     if (path === "/__debug/log") {
       const secret = url.searchParams.get("secret") || "";
-      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+      const validAdminSecret = (env.ZENDESK_WEBHOOK_SECRET && secret === env.ZENDESK_WEBHOOK_SECRET) || (env.ADMIN_SECRET && secret === env.ADMIN_SECRET);
+      if (!validAdminSecret) {
         return new Response("Unauthorized", { status: 401 });
       }
       const log = await env.OAUTH_KV.get("__debug_log");
@@ -1683,7 +1695,8 @@ export default {
     }
     if (path === "/__debug/clear") {
       const secret = url.searchParams.get("secret") || "";
-      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+      const validAdminSecret = (env.ZENDESK_WEBHOOK_SECRET && secret === env.ZENDESK_WEBHOOK_SECRET) || (env.ADMIN_SECRET && secret === env.ADMIN_SECRET);
+      if (!validAdminSecret) {
         return new Response("Unauthorized", { status: 401 });
       }
       await env.OAUTH_KV.delete("__debug_log");
@@ -1691,7 +1704,8 @@ export default {
     }
     if (path === "/__debug") {
       const secret = url.searchParams.get("secret") || "";
-      if (!env.ZENDESK_WEBHOOK_SECRET || secret !== env.ZENDESK_WEBHOOK_SECRET) {
+      const validAdminSecret = (env.ZENDESK_WEBHOOK_SECRET && secret === env.ZENDESK_WEBHOOK_SECRET) || (env.ADMIN_SECRET && secret === env.ADMIN_SECRET);
+      if (!validAdminSecret) {
         return new Response("Unauthorized", { status: 401 });
       }
       return json({
